@@ -46,6 +46,25 @@ Verify inference:
 python verify_inference.py --layer_block_id 3
 ```
 
+## TEE Verification
+
+To verify training blocks in a Trusted Execution Environment (TEE), ensure your platform supports and has enabled Intel SGX or Intel TDX. For detailed setup instructions, refer to the [Intel Confidential Computing documentation](https://cc-enabling.trustedservices.intel.com/).
+
+Install Gramine. You can install Gramine following the [official Gramine documentation](https://gramine.readthedocs.io/en/stable/) or use [Gramine-TDX](https://github.com/gramineproject/gramine-tdx) for Intel TDX support.
+
+**Example: Verify a block using Gramine SGX:**
+
+```bash
+# Step 1: Generate private key for SGX signing
+gramine-sgx-gen-private-key
+
+# Step 2: Build the SGX-enabled manifest
+make SGX=1
+
+# Step 3: Run verification in SGX enclave
+gramine-sgx ./aftune verify_block.py --layer_block_id 1 --step_block_id 7
+```
+
 ## Detailed Usage
 
 ### main.py - Fine-tune Models
@@ -128,25 +147,6 @@ Verify the correctness of inference computation.
 ```bash
 # Verify with float32 precision
 python verify_inference.py --layer_block_id 3 --use_float32
-```
-
-## TEE Verification
-
-To verify training blocks in a Trusted Execution Environment (TEE), ensure your platform supports and has enabled Intel SGX or Intel TDX. For detailed setup instructions, refer to the [Intel Confidential Computing documentation](https://cc-enabling.trustedservices.intel.com/).
-
-Install Gramine. You can install Gramine following the [official Gramine documentation](https://gramine.readthedocs.io/en/stable/) or use [Gramine-TDX](https://github.com/gramineproject/gramine-tdx) for Intel TDX support.
-
-**Example: Verify a block using Gramine SGX:**
-
-```bash
-# Step 1: Generate private key for SGX signing
-gramine-sgx-gen-private-key
-
-# Step 2: Build the SGX-enabled manifest
-make SGX=1
-
-# Step 3: Run verification in SGX enclave
-gramine-sgx ./aftune verify_block.py --layer_block_id 1 --step_block_id 7
 ```
 
 ## Attack Scripts
