@@ -46,25 +46,6 @@ Verify inference:
 python verify_inference.py --layer_block_id 3
 ```
 
-## TEE Verification
-
-To verify training blocks in a Trusted Execution Environment (TEE), ensure your platform supports and has enabled Intel SGX or Intel TDX. For detailed setup instructions, refer to the [Intel Confidential Computing documentation](https://cc-enabling.trustedservices.intel.com/).
-
-Install Gramine. You can install Gramine following the [official Gramine documentation](https://gramine.readthedocs.io/en/stable/) or use [Gramine-TDX](https://github.com/gramineproject/gramine-tdx) for Intel TDX support.
-
-**Example: Verify a block using Gramine SGX:**
-
-```bash
-# Step 1: Generate private key for SGX signing
-gramine-sgx-gen-private-key
-
-# Step 2: Build the SGX-enabled manifest
-make SGX=1
-
-# Step 3: Run verification in SGX enclave
-gramine-sgx ./aftune verify_block.py --layer_block_id 1 --step_block_id 7
-```
-
 ## Detailed Usage
 
 ### main.py - Fine-tune Models
@@ -79,6 +60,7 @@ Fine-tune LLM or vision models with AFTUNE recording.
 - `--checkpoint_interval`: Checkpoint save interval (I_C, default: 1)
 - `--batch_size`: Batch size (default: 16)
 - `--use_lora`: Enable LoRA fine-tuning
+- `--deterministic`: Enable deterministic mode for bit-identical results
 - `-r, --record_dir`: Record directory (default: `./block_records`)
 - `--output_dir`: Output directory for fine-tuned model (default: `./finetuned_model`)
 
@@ -99,6 +81,7 @@ Generate missing checkpoints or activations for specific blocks (required when `
 - `-r, --record_dir`: Record directory (default: `./block_records`)
 - `--layer_block_id`: Layer Block ID (required)
 - `--step_block_id`: Step Block ID (required)
+- `--deterministic`: Enable deterministic mode for bit-identical results
 
 ### verify_block.py - Verify Training Blocks
 
@@ -147,6 +130,25 @@ Verify the correctness of inference computation.
 ```bash
 # Verify with float32 precision
 python verify_inference.py --layer_block_id 3 --use_float32
+```
+
+## TEE Verification
+
+To verify training blocks in a Trusted Execution Environment (TEE), ensure your platform supports and has enabled Intel SGX or Intel TDX. For detailed setup instructions, refer to the [Intel Confidential Computing documentation](https://cc-enabling.trustedservices.intel.com/).
+
+Install Gramine. You can install Gramine following the [official Gramine documentation](https://gramine.readthedocs.io/en/stable/) or use [Gramine-TDX](https://github.com/gramineproject/gramine-tdx) for Intel TDX support.
+
+**Example: Verify a block using Gramine SGX:**
+
+```bash
+# Step 1: Generate private key for SGX signing
+gramine-sgx-gen-private-key
+
+# Step 2: Build the SGX-enabled manifest
+make SGX=1
+
+# Step 3: Run verification in SGX enclave
+gramine-sgx ./aftune verify_block.py --layer_block_id 1 --step_block_id 7
 ```
 
 ## Attack Scripts
@@ -208,6 +210,8 @@ The hash module (`aftune_hash`) provides GPU-accelerated hash computation for da
 ## Reproducibility
 
 All experiments run on NVIDIA RTX PRO 6000 GPUs with 96GB memory and Intel Xeon Gold 5520+ CPUs.
+
+If hash mismatches are reported by `prepare_block.py`, enable deterministic mode on both `main.py` and `prepare_block.py`. On our platform, only the `dinov2_giant` model requires deterministic mode to achieve bit-identical results, with no or minor performance degradation.
 
 ## License
 
