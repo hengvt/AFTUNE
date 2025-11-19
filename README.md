@@ -33,7 +33,7 @@ python verify_block.py --layer_block_id 1 --step_block_id 7 -d cpu
 
 Record inference (B_L=4, I_A=4):
 ```bash
-python inference.py --model_path ./finetuned_model -l 4 --activation_interval 4 --prompt "Your prompt here"
+python inference.py --model_path ./finetuned_model -l 4 --activation_interval 4
 ```
 
 Prepare activations for a specific block (required when activation_interval > 1):
