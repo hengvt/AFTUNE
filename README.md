@@ -38,7 +38,7 @@ python inference.py --model_path ./finetuned_model -l 4 --activation_interval 4 
 
 Prepare activations for a specific block (required when activation_interval > 1):
 ```bash
-python prepare_block.py --layer_block_id 0 --step_block_id 3 --record_dir ./inference_records/<prompt_hash>
+python prepare_block.py --layer_block_id 3 --step_block_id 0 --record_dir ./inference_records/<prompt_hash>
 ```
 
 Verify inference:
