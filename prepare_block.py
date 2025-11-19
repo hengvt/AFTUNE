@@ -257,7 +257,7 @@ def generate_single_layer_block(layer_block_id, step_block_id, recorder, device,
     replay_start = source_step
     replay_end = target_step + steps_per_block if needs_activation else target_step
     
-    if replay_start >= replay_end and (is_inference and needs_activation):
+    if replay_start < replay_end or (is_inference and needs_activation):
         replay_end = target_step + steps_per_block
         
         is_last_block = (layer_names[-1] == layer_order[-1])
