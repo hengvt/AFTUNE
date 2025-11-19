@@ -86,7 +86,7 @@ def record_inference_llm(model, tokenizer, prompt, recorder, device):
         hook.remove()
     
     
-    return inference_time
+    return inference_time, predicted_token_id, predicted_token
 
 def record_inference_image(model, model_hooks, image, recorder, device, model_name):
     model.eval()
@@ -135,7 +135,7 @@ def record_inference_image(model, model_hooks, image, recorder, device, model_na
         hook.remove()
     
     
-    return inference_time
+    return inference_time, predicted_label
 
 
 def main():
@@ -271,9 +271,11 @@ def main():
     start_disk_size = get_dir_size(input_dir) if recorder.enabled else 0
     
     if is_llm:
-        inference_time = record_inference_llm(model, tokenizer, args.prompt, recorder, args.device)
+        inference_time, predicted_token_id, predicted_token = record_inference_llm(model, tokenizer, args.prompt, recorder, args.device)
+        print(f"Inference result: token_id={predicted_token_id}, token={predicted_token}")
     else:
-        inference_time = record_inference_image(model, model_hooks, image, recorder, args.device, model_name)
+        inference_time, predicted_label = record_inference_image(model, model_hooks, image, recorder, args.device, model_name)
+        print(f"Inference result: label={predicted_label}")
     
     end_disk_size = get_dir_size(input_dir) if recorder.enabled else 0
     
@@ -284,7 +286,7 @@ def main():
     print("="*80)
     print(f"Inference time: {inference_time:.3f} seconds")
     if recorder.enabled:
-        print(f"Disk consumption: {format_size(disk_consumed)} ({disk_consumed:,} bytes)")
+        print(f"Disk consumption: {format_size(disk_consumed)}")
     else:
         print("Recording function disabled")
     print("="*80)
