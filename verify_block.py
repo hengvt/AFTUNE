@@ -661,10 +661,40 @@ def main():
     if 'error' in result:
         raise RuntimeError(result['error'])
     
-    time_stats = result['time_stats']
-    total_time = sum(time_stats.values())
-    if total_time > 0:
-        print(f"\nVerification time: {total_time:.3f} seconds")
+    if result.get('steps'):
+        for step_result in result['steps']:
+            step = step_result['step']
+            if step_result.get('forward_per_layer'):
+                for name, m in step_result['forward_per_layer'].items():
+                    print(f"Step {step} Forward: rel_l2={m['relative_l2']:.2e}")
+            if step_result.get('backward_per_layer'):
+                for name, m in step_result['backward_per_layer'].items():
+                    print(f"Step {step} Backward: rel_l2={m['relative_l2']:.2e}")
+    
+    if result.get('weight_verification'):
+        wv = result['weight_verification']
+        if 'layer_overall_l2' in wv:
+            print("Weight verification:")
+            for layer_name, l2 in wv['layer_overall_l2'].items():
+                print(f"  {layer_name}: rel_l2={l2:.2e}")
+    
+    if result.get('optimizer_state_verification'):
+        osv = result['optimizer_state_verification']
+        if osv.get('mode') == 'numeric':
+            print(f"Optimizer state: max_abs={osv['max_abs']:.2e}, mean_abs={osv['mean_abs']:.2e}, rel_l2={osv['relative_l2']:.2e}")
+    
+    if 'time_stats' in result:
+        time_stats = result['time_stats']
+        total_time = sum(time_stats.values())
+        print("\n" + "="*60)
+        print("Verification time statistics")
+        print("="*60)
+        print(f"Data loading:         {time_stats['load_data']:7.3f} seconds ({time_stats['load_data']/total_time*100:5.1f}%)")
+        print(f"Hash verification:    {time_stats['hash_verification']:7.3f} seconds ({time_stats['hash_verification']/total_time*100:5.1f}%)")
+        print(f"Forward computation:  {time_stats['forward_pass']:7.3f} seconds ({time_stats['forward_pass']/total_time*100:5.1f}%)")
+        print(f"Backward computation: {time_stats['backward_pass']:7.3f} seconds ({time_stats['backward_pass']/total_time*100:5.1f}%)")
+        print(f"Total time:           {total_time:7.3f} seconds")
+        print("="*60)
     
     
 
