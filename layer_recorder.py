@@ -1016,8 +1016,6 @@ os.remove(input_file)
             total_blocking_time = total_copy_time + total_hash_time + total_save_time
         
         print(f"  Total overhead: {total_blocking_time:.3f} seconds")
-        if self.async_save and total_save_time > 0.001:
-            print(f"  Background save: {total_save_time:.3f} seconds (parallel)")
     
     def wait_all_tasks(self):
         if self.executor is not None and self.pending_futures:
