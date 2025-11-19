@@ -28,7 +28,7 @@ python prepare_block.py --layer_block_id 1 --step_block_id 7
 
 Verify a specific block:
 ```bash
-python verify_block.py --layer_block_id 1 --step_block_id 7
+python verify_block.py --layer_block_id 1 --step_block_id 7 -d cpu
 ```
 
 Record inference (B_L=4, I_A=4):
@@ -43,7 +43,7 @@ python prepare_block.py --layer_block_id 3 --step_block_id 0 --record_dir ./infe
 
 Verify inference:
 ```bash
-python verify_inference.py --layer_block_id 3
+python verify_inference.py --layer_block_id 3 -d cpu
 ```
 
 ## Detailed Usage
@@ -148,7 +148,7 @@ gramine-sgx-gen-private-key
 make SGX=1
 
 # Step 3: Run verification in SGX enclave
-gramine-sgx ./aftune verify_block.py --layer_block_id 1 --step_block_id 7
+gramine-sgx ./aftune verify_block.py --layer_block_id 1 --step_block_id 7 -d cpu
 ```
 
 ## Attack Scripts
