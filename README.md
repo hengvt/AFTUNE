@@ -1,6 +1,6 @@
 # AFTUNE
 
-This is the official repository for `AFTUNE: Auditable Fine-Tuning and Inference in Cloud AI Infrastructures`
+This is the official repository for `Trusting What You Cannot See: Auditable Fine-Tuning and Inference for Proprietary AI`
 
 ## Installation
 
