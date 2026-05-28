@@ -2,6 +2,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from datasets import load_dataset
 from torchvision import transforms
+from tqdm import tqdm
 
 
 class ChatDataset(Dataset):
@@ -60,10 +61,11 @@ def get_llm_dataloader(tokenizer, batch_size=4, max_length=128, seed=None):
 
 
 class ImageNetDataset(Dataset):
-    def __init__(self, split='train', image_size=224, data_offset=0):
+    def __init__(self, split='train', image_size=224, data_offset=0, max_samples=4096):
         self.split = split
         self.image_size = image_size
         self.data_offset = data_offset
+        self.max_samples = max_samples
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
@@ -73,17 +75,20 @@ class ImageNetDataset(Dataset):
         ds = load_dataset("timm/mini-imagenet", split=split)
         
         self.samples = []
-        for item in ds:
+        skipped = 0
+        loaded = 0
+        for item in tqdm(ds, desc=f"ImageNet {split}", total=max_samples):
+            if skipped < data_offset:
+                skipped += 1
+                continue
+            if loaded >= max_samples:
+                break
             image = item['image']
             label = item['label']
-            
             if image.mode != 'RGB':
                 image = image.convert('RGB')
-            
             self.samples.append((image, label))
-        
-        if data_offset > 0:
-            self.samples = self.samples[data_offset:]
+            loaded += 1
     
     def __len__(self):
         return len(self.samples)
@@ -93,8 +98,8 @@ class ImageNetDataset(Dataset):
         image = self.transform(image)
         return image, label
 
-def get_imagenet_dataloader(batch_size=32, image_size=224, split='train', num_workers=4, data_offset=0, seed=None, shuffle=True):
-    dataset = ImageNetDataset(split=split, image_size=image_size, data_offset=data_offset)
+def get_imagenet_dataloader(batch_size=32, image_size=224, split='train', num_workers=4, data_offset=0, max_samples=4096, seed=None, shuffle=True):
+    dataset = ImageNetDataset(split=split, image_size=image_size, data_offset=data_offset, max_samples=max_samples)
     generator = None
     if seed is not None:
         generator = torch.Generator()

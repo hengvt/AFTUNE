@@ -4,10 +4,12 @@ import os
 import json
 import time
 from layer_recorder import LayerRecorder, set_deterministic
-from verify_block import get_hash
+from verify_block import forward_block_layer, get_hash
+from decoder_replay import new_rope_state
 from PIL import Image
 from torchvision import transforms
 
+# Forward-only replay of one inference layer block vs recorded activations
 def verify_inference(layer_block_id, inference_records_dir, block_records_dir, device, strict_hash, image_path, use_float32, use_float64):
     rec = LayerRecorder(save_dir=inference_records_dir)
     metadata = rec.load_metadata()
@@ -45,6 +47,7 @@ def verify_inference(layer_block_id, inference_records_dir, block_records_dir, d
     if not os.path.exists(final_dir):
         return {'error': f'Cannot find final_model directory: {final_dir}'}
 
+    # Load finetuned weights from block_records/final_model and verify hashes
     hash_start = time.time()
     for layer_name in layer_names:
         layer_dir = os.path.join(final_dir, layer_name)
@@ -64,7 +67,9 @@ def verify_inference(layer_block_id, inference_records_dir, block_records_dir, d
             param_file = os.path.join(params_dir, f'{safe_name}.pt')
             param_tensor = torch.load(param_file, map_location=device, weights_only=False)
             
-            expected_hash = parameter_hashes.get(original_name)
+            if original_name not in parameter_hashes:
+                return {'error': f'{layer_name}.{original_name} missing parameter hash'}
+            expected_hash = parameter_hashes[original_name]
             actual_hash = get_hash(param_tensor, metadata['chunk_size'], metadata['use_blake3'])
             if actual_hash != expected_hash:
                 return {'error': f'{layer_name}.{original_name} hash mismatch'}
@@ -94,8 +99,7 @@ def verify_inference(layer_block_id, inference_records_dir, block_records_dir, d
     rec.layer_blocks_finalized = True
     
     ds = rec.load_dataset_record(step, device=device)
-    expected_label = ds.get('label')
-    
+
     if is_llm:
         if 'input_ids' not in ds:
             return {'error': f'Cannot find input_ids record at step {step}'}
@@ -125,12 +129,22 @@ def verify_inference(layer_block_id, inference_records_dir, block_records_dir, d
     time_stats['load_data'] += time.time() - load_start
 
     layer_outputs = {}
-    forward_metrics_per_layer = {}
-    
+    block_diff_norm_sq = 0.0
+    block_expected_norm_sq = 0.0
+
     is_block_first_layer = {name: (layer_names.index(name) == 0) for name in layer_names}
     is_block_last_layer = {name: (layer_names.index(name) == len(layer_names) - 1) for name in layer_names}
     is_global_first_layer = {name: (layer_order.index(name) == 0) for name in layer_names}
     
+    rotary_emb_cache = {}
+    rotary_emb_module = None
+    rope_state = None
+    if is_llm:
+        rotary_emb_path = os.path.join(block_recorder.module_structure_dir, model_name, "module_structures", "rotary_emb.pt")
+        if os.path.isfile(rotary_emb_path):
+            rotary_emb_module = block_recorder.load_module_structure("rotary_emb", device=device)
+        rope_state = new_rope_state(rotary_emb_module, model_name)
+    # Chain layer forwards; compare last layer output to inference record
     with torch.no_grad():
         for idx, layer_name in enumerate(layer_names):
             layer_module = layers[layer_name]
@@ -149,10 +163,9 @@ def verify_inference(layer_block_id, inference_records_dir, block_records_dir, d
                             return {'error': f'{layer_name}: Input hash mismatch'}
                         time_stats['hash_verification'] += time.time() - hash_start
             elif is_block_first_layer[layer_name]:
-                prev_block_layers = block_to_layers.get(layer_block_id - 1, [])
-                if not prev_block_layers:
+                if layer_block_id - 1 not in block_to_layers:
                     return {'error': f'Cannot find previous block layers'}
-                prev_last = prev_block_layers[-1]
+                prev_last = block_to_layers[layer_block_id - 1][-1]
                 input_tensor = rec.load_layer_output(prev_last, step, device=device)
             else:
                 prev_layer = layer_names[idx - 1]
@@ -162,37 +175,12 @@ def verify_inference(layer_block_id, inference_records_dir, block_records_dir, d
             time_stats['load_data'] += time.time() - load_start
             
             forward_start = time.time()
-            if layer_name == 'embedding':
-                if input_tensor.dtype == torch.long:
-                    computed_output = layer_module(input_tensor)
-                else:
-                    computed_output = input_tensor
-            elif layer_name.startswith('layer_') or layer_name.startswith('encoder_layer_'):
-                if is_llm:
-                    position_ids = torch.arange(0, input_tensor.shape[1], device=device).unsqueeze(0)
-                    output = layer_module(input_tensor, position_ids=position_ids)
-                    computed_output = output[0] if isinstance(output, tuple) else output
-                else:
-                    output = layer_module(input_tensor)
-                    computed_output = output[0] if isinstance(output, tuple) else output
-            elif layer_name in ['norm', 'lm_head', 'layernorm']:
-                computed_output = layer_module(input_tensor)
-            elif layer_name == 'classifier':
-                if model_name == "dinov2_giant" and len(input_tensor.shape) == 3:
-                    cls_token = input_tensor[:, 0]
-                    patch_tokens = input_tensor[:, 1:]
-                    patch_mean = patch_tokens.mean(dim=1)
-                    processed_input = torch.cat([cls_token, patch_mean], dim=1)
-                elif model_name == "vit_large" and len(input_tensor.shape) == 3:
-                    processed_input = input_tensor[:, 0, :]
-                else:
-                    processed_input = input_tensor
-                computed_output = layer_module(processed_input)
-            else:
-                computed_output = layer_module(input_tensor)
-                if isinstance(computed_output, tuple):
-                    computed_output = computed_output[0]
-            
+            computed_output, _ = forward_block_layer(
+                layer_name, layer_module, input_tensor, model_name, False,
+                rotary_emb_module if is_llm else None, rotary_emb_cache, rope_state if is_llm else None,
+            )
+            if isinstance(computed_output, tuple):
+                computed_output = computed_output[0]
             layer_outputs[layer_name] = computed_output
             time_stats['forward_pass'] += time.time() - forward_start
             
@@ -213,55 +201,19 @@ def verify_inference(layer_block_id, inference_records_dir, block_records_dir, d
                         return {'error': f'{layer_name}: Computed output hash mismatch'}
                     time_stats['hash_verification'] += time.time() - hash_start
                 
-                diff = torch.abs(computed_output - expected_output)
-                forward_metrics_per_layer[layer_name] = {
-                    'max_abs': diff.max().item(),
-                    'mean_abs': diff.mean().item(),
-                    'relative_l2': (torch.norm(diff) / torch.norm(expected_output)).item()
-                }
+                diff = computed_output - expected_output
+                block_diff_norm_sq += torch.sum(diff * diff).item()
+                block_expected_norm_sq += torch.sum(expected_output * expected_output).item()
+                del expected_output, diff
 
-    output_verification = None
-    if is_llm and 'lm_head' in layer_names:
-        lm_head_output = layer_outputs['lm_head']
-        computed_token_id = torch.argmax(lm_head_output[:, -1, :], dim=-1).item()
-        
-        if expected_label is not None:
-            token_match = (computed_token_id == expected_label)
-            output_verification = {
-                'computed_token_id': computed_token_id,
-                'expected_label': expected_label,
-                'match': token_match
-            }
-        else:
-            output_verification = {
-                'computed_token_id': computed_token_id,
-                'expected_label': None,
-                'match': None
-            }
-    elif not is_llm and 'classifier' in layer_names:
-        classifier_output = layer_outputs['classifier']
-        computed_label = torch.argmax(classifier_output, dim=-1).item()
-        
-        if expected_label is not None:
-            label_match = (computed_label == expected_label)
-            output_verification = {
-                'computed_label': computed_label,
-                'expected_label': expected_label,
-                'match': label_match
-            }
-        else:
-            output_verification = {
-                'computed_label': computed_label,
-                'expected_label': None,
-                'match': None
-            }
+    if block_expected_norm_sq > 0:
+        overall_relative_l2 = (block_diff_norm_sq ** 0.5) / (block_expected_norm_sq ** 0.5 + 1e-10)
+    else:
+        overall_relative_l2 = 0.0
 
     return {
-        'layer_block_id': layer_block_id,
-        'layer_names': layer_names,
-        'forward_per_layer': forward_metrics_per_layer,
-        'output_verification': output_verification,
-        'time_stats': time_stats
+        'overall_relative_l2': overall_relative_l2,
+        'time_stats': time_stats,
     }
 
 
@@ -298,10 +250,8 @@ def main():
     if 'error' in result:
         raise RuntimeError(result['error'])
     
-    if result['forward_per_layer']:
-        for name, m in result['forward_per_layer'].items():
-            print(f"{name}: max={m['max_abs']:.2e}, mean={m['mean_abs']:.2e}, rel_l2={m['relative_l2']:.2e}")
-    
+    print(f"\nBlock Forward L2: {result['overall_relative_l2']:.2e}")
+
     if 'time_stats' in result:
         time_stats = result['time_stats']
         total_time = sum(time_stats.values())

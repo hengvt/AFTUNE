@@ -4,15 +4,17 @@ import torch.nn as nn
 import time
 from tqdm import tqdm
 
-def register_module_hooks(module, module_name, recorder, is_first_layer, is_last_layer):
+# Register forward/backward hooks on one module for recording
+def register_module_hooks(module, module_name, recorder, is_last_layer):
     forward_hook = module.register_forward_hook(
-        recorder.create_forward_hook(module_name, is_first_layer=is_first_layer)
+        recorder.create_forward_hook(module_name, is_last_layer=is_last_layer)
     )
     backward_hook = module.register_full_backward_hook(
-        recorder.create_backward_hook(module_name, is_last_layer=is_last_layer)
+        recorder.create_backward_hook(module_name)
     )
     return (forward_hook, backward_hook)
 
+# Collect embedding, decoder layers, norm, lm_head for AFTUNE tracking
 def get_tracked_modules(model):
     tracked_modules = {}
     num_layers = len(model.model.layers)
@@ -26,12 +28,13 @@ def get_tracked_modules(model):
     
     return tracked_modules
 
+# Attach recorder hooks to all tracked LLM modules
 def register_hooks_with_recorder(model, recorder):
     hooks = []
     num_layers = len(model.model.layers)
     
     embed_forward = model.model.embed_tokens.register_forward_hook(
-        recorder.create_forward_hook("embedding", is_first_layer=True)
+        recorder.create_forward_hook("embedding")
     )
     embed_backward = model.model.embed_tokens.register_full_backward_hook(
         recorder.create_backward_hook("embedding")
@@ -64,12 +67,13 @@ def register_hooks_with_recorder(model, recorder):
         recorder.create_forward_hook("lm_head", is_last_layer=True)
     )
     lm_head_backward = model.lm_head.register_full_backward_hook(
-        recorder.create_backward_hook("lm_head", is_last_layer=True)
+        recorder.create_backward_hook("lm_head")
     )
     hooks.append((lm_head_forward, lm_head_backward))
     
     return hooks
 
+# Full-parameter finetune with per-step layer/dataset recording
 def finetune_llm_full(model, dataloader, recorder, epochs, learning_rate, max_samples, warmup_steps):
     model.train()
     
@@ -79,8 +83,11 @@ def finetune_llm_full(model, dataloader, recorder, epochs, learning_rate, max_sa
     recorder.layer_order_finalized = True
     recorder.finalize_layer_blocks()
     
+    # Save module skeletons (and rotary_emb) for offline replay
     for layer_name, module in tracked_modules.items():
         recorder.save_module_structure(layer_name, module)
+    if hasattr(model.model, "rotary_emb"):
+        recorder.save_module_structure("rotary_emb", model.model.rotary_emb)
     
     hooks = register_hooks_with_recorder(model, recorder)
     
@@ -133,6 +140,7 @@ def finetune_llm_full(model, dataloader, recorder, epochs, learning_rate, max_sa
             if max_steps is not None and recorder.current_step >= max_steps:
                 break
             
+            # Snapshot weights/optimizer at step-block boundary before forward
             for layer_name, module in tracked_modules.items():
                 recorder.record_checkpoint(layer_name, module)
             
@@ -208,6 +216,7 @@ class LinearWithLoRA(torch.nn.Module):
     def forward(self, x):
         return self.linear(x) + self.lora(x)
 
+# Replace target Linear layers with LoRA wrappers
 def apply_lora_to_model(model, target_modules, lora_r, lora_alpha):
     lora_modules = {}
     
@@ -226,6 +235,7 @@ def apply_lora_to_model(model, target_modules, lora_r, lora_alpha):
     
     return lora_modules
 
+# LoRA finetune: same recording pipeline, only trainable adapters updated
 def finetune_llm_lora(model, dataloader, recorder, epochs, learning_rate, 
                   max_samples, target_modules, lora_r, lora_alpha, warmup_steps):    
     model.train()
@@ -250,6 +260,8 @@ def finetune_llm_lora(model, dataloader, recorder, epochs, learning_rate,
     
     for layer_name, module in tracked_modules.items():
         recorder.save_module_structure(layer_name, module)
+    if hasattr(model.model, "rotary_emb"):
+        recorder.save_module_structure("rotary_emb", model.model.rotary_emb)
     
     hooks = register_hooks_with_recorder(model, recorder)
     
@@ -306,6 +318,7 @@ def finetune_llm_lora(model, dataloader, recorder, epochs, learning_rate,
             if max_steps is not None and recorder.current_step >= max_steps:
                 break
             
+            # Snapshot LoRA weights at step-block boundary before forward
             for layer_name, module in tracked_modules.items():
                 recorder.record_checkpoint(layer_name, module)
             
@@ -350,6 +363,7 @@ def finetune_llm_lora(model, dataloader, recorder, epochs, learning_rate,
         print(f"\nLoRA training statistics: {total_steps} steps, {total_samples} samples, {len(lora_modules)} modules, {total_train_time:.3f} seconds")
 
 
+# Manual forward through DINOv2 blocks with embedding grad retained for split backward
 def dinov2_forward(model, inputs, tracked_modules, loss_fn, labels):
     embedding_module = tracked_modules['embeddings']
     
@@ -382,6 +396,7 @@ def dinov2_forward(model, inputs, tracked_modules, loss_fn, labels):
     
     return embedding_output, loss
 
+# Backprop through classifier/encoder then into embedding via autograd.grad
 def dinov2_backward(model, embedding_output, loss):
     non_embedding_params = []
     for name, param in model.named_parameters():
@@ -407,6 +422,7 @@ def dinov2_backward(model, embedding_output, loss):
     finally:
         torch.use_deterministic_algorithms(prev)
 
+# Vision model finetune with per-layer hooks (ResNet/ViT/DINOv2)
 def finetune_imagenet(model, dataloader, recorder, model_hooks, epochs, learning_rate, max_samples, warmup_steps):
     model.train()
     
@@ -423,9 +439,8 @@ def finetune_imagenet(model, dataloader, recorder, model_hooks, epochs, learning
     
     hooks = []
     for idx, (module, layer_name) in enumerate(model_hooks):
-        is_first = (idx == 0)
         is_last = (idx == len(model_hooks) - 1)
-        hook_pair = register_module_hooks(module, layer_name, recorder, is_first_layer=is_first, is_last_layer=is_last)
+        hook_pair = register_module_hooks(module, layer_name, recorder, is_last_layer=is_last)
         hooks.append(hook_pair)
     
     if recorder.optimizer_type == 'sgd':

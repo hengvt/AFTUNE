@@ -1,11 +1,19 @@
 import argparse
 import os
+import sys
+from pathlib import Path
+
+AFTUNE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(AFTUNE_ROOT))
+DEFAULT_MODEL_PATH = str(AFTUNE_ROOT / "finetuned_model")
+DEFAULT_IMAGE_PATH = str(AFTUNE_ROOT / "image.jpg")
 
 import torch
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
 from load_model import load_vit_large, load_dinov2_giant, load_image, load_llm_model
+from decoder_replay import decoder_layer_forward, llm_decoder_rope
 
 
 def load_base_model(model_path, device):
@@ -40,24 +48,26 @@ def forward_with_all_blocks_attack_llm(model, inputs_embeds,
     inputs_embeds = inputs_embeds.to(target_dtype)
     
     hidden_states = inputs_embeds
-    position_ids = torch.arange(0, hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
-    
     num_blocks = len(model.model.layers)
     attack_indices = attack_indices or list(block_deltas.keys())
-    
-    def layer_forward(layer, hidden_states, position_ids):
-        output = layer(hidden_states, position_ids=position_ids)
+    rotary_emb_cache = {}
+    rotary_emb_module, text_pos, rope_embeddings = llm_decoder_rope(model, hidden_states)
+
+    def layer_forward(layer, hidden_states):
+        output = decoder_layer_forward(
+            layer, hidden_states, text_pos, rotary_emb_cache, rotary_emb_module,
+            position_embeddings_precomputed=rope_embeddings,
+        )
         return output[0] if isinstance(output, tuple) else output
-    
+
     for idx in range(num_blocks):
         if idx in attack_indices and idx in block_deltas and block_deltas[idx] is not None:
             hidden_states = hidden_states + block_deltas[idx].to(target_dtype)
-        
+
         if use_checkpoint and hidden_states.requires_grad:
-            hidden_states = checkpoint(layer_forward, model.model.layers[idx], hidden_states, position_ids, use_reentrant=False)
+            hidden_states = checkpoint(layer_forward, model.model.layers[idx], hidden_states, use_reentrant=False)
         else:
-            output = model.model.layers[idx](hidden_states, position_ids=position_ids)
-            hidden_states = output[0] if isinstance(output, tuple) else output
+            hidden_states = layer_forward(model.model.layers[idx], hidden_states)
     
     if hasattr(model.model, 'norm'):
         hidden_states = model.model.norm(hidden_states)
@@ -140,18 +150,20 @@ def build_inputs_embeds(model, tokenizer, text, device):
 def get_all_blocks_input_llm(model, inputs_embeds):
     target_dtype = model.get_input_embeddings().weight.dtype
     hidden_states = inputs_embeds.to(target_dtype)
-    seq_len = hidden_states.shape[1]
-    position_ids = torch.arange(0, seq_len, device=hidden_states.device).unsqueeze(0)
-    
+    rotary_emb_cache = {}
+    rotary_emb_module, text_pos, rope_embeddings = llm_decoder_rope(model, hidden_states)
     block_inputs = []
     num_blocks = len(model.model.layers)
-    
+
     with torch.no_grad():
         for idx in range(num_blocks):
             block_inputs.append(hidden_states.clone())
-            output = model.model.layers[idx](hidden_states, position_ids=position_ids)
+            output = decoder_layer_forward(
+                model.model.layers[idx], hidden_states, text_pos, rotary_emb_cache, rotary_emb_module,
+                position_embeddings_precomputed=rope_embeddings,
+            )
             hidden_states = output[0] if isinstance(output, tuple) else output
-    
+
     return block_inputs
 
 
@@ -456,6 +468,12 @@ def format_block_l2s(block_l2s, block_rel_l2s):
     return " | ".join(parts)
 
 
+def print_block_rel_l2_summary(rel_l2_or_blocks):
+    vals = list(rel_l2_or_blocks.values())
+    print(f"min L2: {min(vals):.3e}")
+    print(f"Max L2: {max(vals):.3e}")
+
+
 def format_scientific_latex(value):
     if value == 0.0:
         return "$0$"
@@ -601,14 +619,14 @@ def run_single_sample(model, device, max_epsilon, pgd_iters, interval=0,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-p', '--model_path', type=str, default="./finetuned_model", help='Model path')
+    parser.add_argument('-p', '--model_path', type=str, default=DEFAULT_MODEL_PATH, help='Model path')
     parser.add_argument("--model_type", type=str, default=None,
                        choices=[None, "vit_large", "dinov2_giant"])
     parser.add_argument('-d', '--device', type=str, default="cuda:0")
     parser.add_argument("--max_epsilon", type=float, default=1.0)
     parser.add_argument("--pgd_iters", type=int, default=40)
     parser.add_argument("--text", type=str, default=None)
-    parser.add_argument("--image_path", type=str, default="image.jpg")
+    parser.add_argument("--image_path", type=str, default=DEFAULT_IMAGE_PATH)
     parser.add_argument("--target_class_id", type=int, default=0)
     parser.add_argument("--attack_mode", type=str, default="untargeted", choices=["targeted", "untargeted"])
     parser.add_argument("--interval", type=int, default=0)
@@ -650,7 +668,9 @@ def main():
             orig_class_id = get_target_class_id_image(model, args.model_type, image, device)
             show_attack_result_image(model, args.model_type, image, device, "PGD", attack_location, delta_or_deltas, 
                                    orig_class_id, target_class_id, args.attack_mode)
-            
+            if isinstance(rel_l2_or_blocks, dict) and rel_l2_or_blocks:
+                print_block_rel_l2_summary(rel_l2_or_blocks)
+
     else:
         model, tokenizer = load_base_model(args.model_path, args.device)
         device = next(model.parameters()).device
@@ -674,6 +694,8 @@ def main():
             eps, linf, l2_or_blocks, rel_l2_or_blocks, attack_location, delta_or_deltas = pgd_result
             print(f"PGD: epsilon={eps:.3e}, L_inf={linf:.3e}, location={attack_location}")
             show_attack_result_llm(model, tokenizer, text, device, "PGD", attack_location, delta_or_deltas, attack_mode=args.attack_mode)
+            if isinstance(rel_l2_or_blocks, dict) and rel_l2_or_blocks:
+                print_block_rel_l2_summary(rel_l2_or_blocks)
             
 
 

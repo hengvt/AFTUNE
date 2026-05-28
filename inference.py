@@ -1,3 +1,4 @@
+import inspect
 import torch
 import argparse
 import os
@@ -29,6 +30,7 @@ def format_size(size_bytes):
     return f"{size_bytes:.2f} MB"
 
 
+# One-shot LLM inference with hooks; save activations to inference_records
 def record_inference_llm(model, tokenizer, prompt, recorder, device):
     model.eval()
     
@@ -36,12 +38,22 @@ def record_inference_llm(model, tokenizer, prompt, recorder, device):
     recorder.layer_order = list(tracked_modules.keys())
     recorder.layer_order_finalized = True
     recorder.finalize_layer_blocks()
+    if recorder.enabled and hasattr(model.model, "rotary_emb"):
+        recorder.save_module_structure("rotary_emb", model.model.rotary_emb)
     
     hooks = []
+    rotary_saved = []
+    if hasattr(model.model, "rotary_emb"):
+        def save_rotary_hook(module, inp, out):
+            if isinstance(out, tuple) and len(out) == 2:
+                cos_t, sin_t = out[0], out[1]
+                rotary_saved.append((cos_t.detach().cpu(), sin_t.detach().cpu()))
+
+        hooks.append(model.model.rotary_emb.register_forward_hook(save_rotary_hook))
     num_layers = len(model.model.layers)
     
     embed_forward = model.model.embed_tokens.register_forward_hook(
-        recorder.create_forward_hook("embedding", is_first_layer=True)
+        recorder.create_forward_hook("embedding")
     )
     hooks.append(embed_forward)
     
@@ -60,7 +72,10 @@ def record_inference_llm(model, tokenizer, prompt, recorder, device):
         hooks.append(norm_forward)
     
     messages = [{"role": "user", "content": prompt}]
-    formatted_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+    if "enable_thinking" in inspect.signature(tokenizer.apply_chat_template).parameters:
+        template_kwargs["enable_thinking"] = False
+    formatted_text = tokenizer.apply_chat_template(messages, **template_kwargs)
     input_ids = tokenizer(formatted_text, return_tensors="pt")["input_ids"].to(device)
     
     inference_start = time.time()
@@ -68,6 +83,9 @@ def record_inference_llm(model, tokenizer, prompt, recorder, device):
         outputs = model(input_ids=input_ids, use_cache=False)
         logits = outputs.logits
     inference_time = time.time() - inference_start
+    if len(rotary_saved) > 0:
+        cos_t, sin_t = rotary_saved[0]
+        torch.save({"cos": cos_t, "sin": sin_t}, os.path.join(recorder.save_dir, "rotary_position_embeddings.pt"))
     predicted_token_id = torch.argmax(logits[:, -1, :], dim=-1).item()
     predicted_token = tokenizer.decode([predicted_token_id], skip_special_tokens=False)
     
@@ -88,6 +106,7 @@ def record_inference_llm(model, tokenizer, prompt, recorder, device):
     
     return inference_time, predicted_token_id, predicted_token
 
+# One-shot vision inference with hooks; save activations to inference_records
 def record_inference_image(model, model_hooks, image, recorder, device, model_name):
     model.eval()
     
@@ -98,9 +117,9 @@ def record_inference_image(model, model_hooks, image, recorder, device, model_na
     
     hooks = []
     for idx, (module, layer_name) in enumerate(model_hooks):
-        is_first = (idx == 0)
+        is_last = (idx == len(model_hooks) - 1)
         forward_hook = module.register_forward_hook(
-            recorder.create_forward_hook(layer_name, is_first_layer=is_first)
+            recorder.create_forward_hook(layer_name, is_last_layer=is_last)
         )
         hooks.append(forward_hook)
     
@@ -179,6 +198,7 @@ def main():
     tokenizer = None
     model_hooks = None
     
+    # Run one inference pass and write records under inference_records/<prompt_hash>
     if is_llm:
         from load_model import load_llm_model
         model, tokenizer = load_llm_model(args.model_path, args.device)
@@ -272,10 +292,10 @@ def main():
     
     if is_llm:
         inference_time, predicted_token_id, predicted_token = record_inference_llm(model, tokenizer, args.prompt, recorder, args.device)
-        print(f"Inference result: token_id={predicted_token_id}, token={predicted_token}")
+        print(f"\nInference result: token_id={predicted_token_id}, token={predicted_token}")
     else:
         inference_time, predicted_label = record_inference_image(model, model_hooks, image, recorder, args.device, model_name)
-        print(f"Inference result: label={predicted_label}")
+        print(f"\nInference result: label={predicted_label}")
     
     end_disk_size = get_dir_size(input_dir) if recorder.enabled else 0
     

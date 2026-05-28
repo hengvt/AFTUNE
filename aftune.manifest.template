@@ -52,6 +52,7 @@ sgx.trusted_files = [
   "file:load_data.py",
   "file:load_model.py",
   "file:finetune.py",
+  "file:decoder_replay.py",
   
 ]
 

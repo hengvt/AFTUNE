@@ -1,14 +1,41 @@
 import argparse
+import sys
+from pathlib import Path
+
+AFTUNE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(AFTUNE_ROOT))
+DEFAULT_MODEL_PATH = str(AFTUNE_ROOT / "finetuned_model")
+DEFAULT_IMAGE_PATH = str(AFTUNE_ROOT / "image.jpg")
+
 import torch
 import torch.nn.functional as F
 from collections import defaultdict
 import os
 from load_model import load_vit_large, load_dinov2_giant, load_image
 from attack_ae import get_no_token_id
+from decoder_replay import decoder_layer_forward, llm_decoder_rope
+
+
+def make_llm_rope_state(model, hidden_states):
+    rotary_emb_module, text_pos, rope_embeddings = llm_decoder_rope(model, hidden_states)
+    return {
+        'text_pos': text_pos,
+        'rotary_emb_module': rotary_emb_module,
+        'rope_embeddings': rope_embeddings,
+    }
+
+
+def forward_llm_layer(model, layer_idx, hidden_states, rope_state, rotary_cache):
+    layer = model.model.layers[layer_idx]
+    out = decoder_layer_forward(
+        layer, hidden_states, rope_state['text_pos'], rotary_cache,
+        rope_state['rotary_emb_module'], rope_state['rope_embeddings'],
+    )
+    return out[0] if isinstance(out, tuple) else out
 
 
 def load_model(model_path, device, model_type=None):
-    if model_type and model_type in ['vit_large', 'dinov2_giant']:
+    if model_type in ['vit_large', 'dinov2_giant']:
         if model_type == 'vit_large':
             model, _ = load_vit_large(device=device)
         elif model_type == 'dinov2_giant':
@@ -26,12 +53,6 @@ def load_model(model_path, device, model_type=None):
         return model, tokenizer
 
 
-
-
-def add_trigger_patch(image, patch_size=16, patch_value=1.0):
-    image = image.clone()
-    image[:, :, :patch_size, :patch_size] = patch_value
-    return image
 
 
 def get_prediction(model, tokenizer_or_none, input_data, device, model_type=None):
@@ -57,84 +78,51 @@ def get_prediction(model, tokenizer_or_none, input_data, device, model_type=None
         return predicted_id
 
 def init_layer_groups_and_perturbations(model, num_layers_to_attack, layers_per_group, model_type=None):
-    if model_type and model_type in ['vit_large', 'dinov2_giant']:
-        encoder_layers = model.vit.encoder.layer if model_type == 'vit_large' else model.dinov2.encoder.layer
-        num_layers = len(encoder_layers)
-        if num_layers_to_attack == -1:
-            target_layer_indices = list(range(num_layers))
-        else:
-            target_layer_indices = list(range(max(0, num_layers - num_layers_to_attack), num_layers))
-        prefix = 'vit.encoder.layer.' if model_type == 'vit_large' else 'dinov2.encoder.layer.'
-        
-        layer_groups = []
-        for i in range(0, len(target_layer_indices), layers_per_group):
-            layer_groups.append(target_layer_indices[i:i+layers_per_group])
-        
-        original_params = {}
-        perturbations = {}
-        layer_group_params = {}
-        
-        for name, param in model.named_parameters():
-            for idx in target_layer_indices:
-                if f"{prefix}{idx}." in name:
-                    original_params[name] = param.data.clone().cpu()
-                    perturbations[name] = torch.zeros_like(param.data, dtype=torch.float32, requires_grad=True)
-                    
-                    for group_idx, group in enumerate(layer_groups):
-                        if idx in group:
-                            if group_idx not in layer_group_params:
-                                layer_group_params[group_idx] = []
-                            layer_group_params[group_idx].append(name)
-                            break
-                    break
-        
-        return layer_groups, original_params, perturbations, layer_group_params, num_layers
+    if model_type in ['vit_large', 'dinov2_giant']:
+        num_layers = len(model.vit.encoder.layer if model_type == 'vit_large' else model.dinov2.encoder.layer)
+        layer_prefix = 'vit.encoder.layer.' if model_type == 'vit_large' else 'dinov2.encoder.layer.'
     else:
         num_layers = len(model.model.layers)
-        if num_layers_to_attack == -1:
-            target_layer_indices = list(range(num_layers))
-        else:
-            target_layer_indices = list(range(max(0, num_layers - num_layers_to_attack), num_layers))
-        
-        layer_groups = []
-        for i in range(0, len(target_layer_indices), layers_per_group):
-            layer_groups.append(target_layer_indices[i:i+layers_per_group])
-        
-        original_params = {}
-        perturbations = {}
-        layer_group_params = {}
-        
-        for name, param in model.named_parameters():
-            for idx in target_layer_indices:
-                if f"model.layers.{idx}." in name:
-                    original_params[name] = param.data.clone().cpu()
-                    perturbations[name] = torch.zeros_like(param.data, dtype=torch.float32, requires_grad=True)
-                    
-                    for group_idx, group in enumerate(layer_groups):
-                        if idx in group:
-                            if group_idx not in layer_group_params:
-                                layer_group_params[group_idx] = []
-                            layer_group_params[group_idx].append(name)
-                            break
-                    break
-        
-        return layer_groups, original_params, perturbations, layer_group_params, num_layers
-
-
-
-
-def restore_parameters(model, original_params, device):
+        layer_prefix = 'model.layers.'
+    if num_layers_to_attack == -1:
+        target_layer_indices = list(range(num_layers))
+    else:
+        target_layer_indices = list(range(max(0, num_layers - num_layers_to_attack), num_layers))
+    layer_groups = [
+        target_layer_indices[i:i + layers_per_group]
+        for i in range(0, len(target_layer_indices), layers_per_group)
+    ]
+    original_params = {}
+    perturbations = {}
+    layer_group_params = {}
     for name, param in model.named_parameters():
-        if name in original_params:
-            param.data = original_params[name].to(device=device, dtype=param.dtype)
+        for idx in target_layer_indices:
+            if f"{layer_prefix}{idx}." not in name:
+                continue
+            original_params[name] = param.data.clone().cpu()
+            perturbations[name] = torch.zeros(param.data.shape, dtype=torch.float32, device='cpu', requires_grad=True)
+            for group_idx, group in enumerate(layer_groups):
+                if idx in group:
+                    if group_idx not in layer_group_params:
+                        layer_group_params[group_idx] = []
+                    layer_group_params[group_idx].append(name)
+                    break
+            break
+    return layer_groups, original_params, perturbations, layer_group_params, num_layers
 
 
+def apply_perturbations_to_model(model, original_params, perturbations, device):
+    for name, param in model.named_parameters():
+        if name in perturbations:
+            orig = original_params[name].to(device=device, dtype=param.dtype)
+            pert = perturbations[name].to(device=device, dtype=param.dtype)
+            param.data = (orig + pert).to(param.dtype)
 
 
 def forward_from_hidden_states(model, hidden_states, layer_groups, start_group_idx, num_layers, model_type=None, position_ids=None):
     last_layer_in_group = layer_groups[start_group_idx][-1]
     
-    if model_type and model_type in ['vit_large', 'dinov2_giant']:
+    if model_type in ['vit_large', 'dinov2_giant']:
         encoder_layers = model.vit.encoder.layer if model_type == 'vit_large' else model.dinov2.encoder.layer
         layernorm = model.vit.layernorm if model_type == 'vit_large' else model.dinov2.layernorm
         
@@ -156,8 +144,10 @@ def forward_from_hidden_states(model, hidden_states, layer_groups, start_group_i
         logits = model.classifier(hidden_states)
         return logits
     else:
+        rotary_cache = {}
+        rope_state = make_llm_rope_state(model, hidden_states)
         for idx in range(last_layer_in_group + 1, num_layers):
-            hidden_states = model.model.layers[idx](hidden_states, position_ids=position_ids)[0]
+            hidden_states = forward_llm_layer(model, idx, hidden_states, rope_state, rotary_cache)
             if idx < num_layers - 1:
                 hidden_states = hidden_states.detach().requires_grad_(True)
         
@@ -167,45 +157,23 @@ def forward_from_hidden_states(model, hidden_states, layer_groups, start_group_i
         return logits
 
 
-def forward_layers_before_group(model, model_type, hidden_states, start_idx, end_idx):
-    if model_type and model_type in ['vit_large', 'dinov2_giant']:
-        encoder_layers = model.vit.encoder.layer if model_type == 'vit_large' else model.dinov2.encoder.layer
-        for idx in range(start_idx, end_idx):
-            layer_output = encoder_layers[idx](hidden_states)
-            hidden_states = layer_output[0] if isinstance(layer_output, tuple) else layer_output
-        return hidden_states
-    else:
-        for idx in range(start_idx, end_idx):
-            hidden_states = model.model.layers[idx](hidden_states, position_ids=None)[0]
-        return hidden_states
-
-
-def forward_layer_group(model, model_type, hidden_states, layer_indices, position_ids=None):
-    if model_type and model_type in ['vit_large', 'dinov2_giant']:
+def forward_layer_indices(model, model_type, hidden_states, layer_indices):
+    if model_type in ['vit_large', 'dinov2_giant']:
         encoder_layers = model.vit.encoder.layer if model_type == 'vit_large' else model.dinov2.encoder.layer
         for idx in layer_indices:
             layer_output = encoder_layers[idx](hidden_states)
             hidden_states = layer_output[0] if isinstance(layer_output, tuple) else layer_output
         return hidden_states
-    else:
-        for idx in layer_indices:
-            hidden_states = model.model.layers[idx](hidden_states, position_ids=position_ids)[0]
-        return hidden_states
-
-
-def compute_token_loss(logits, target_token_id):
-    logits = logits[:, -1, :].to(torch.float32)
-    return -F.log_softmax(logits, dim=-1)[0, target_token_id]
-
-
-def compute_classification_loss(logits, target_class_id):
-    logits = logits.to(torch.float32)
-    return -F.log_softmax(logits, dim=-1)[0, target_class_id]
+    rotary_cache = {}
+    rope_state = make_llm_rope_state(model, hidden_states)
+    for idx in layer_indices:
+        hidden_states = forward_llm_layer(model, idx, hidden_states, rope_state, rotary_cache)
+    return hidden_states
 
 
 def layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_group_params, num_layers,
                          samples, optimizer=None, perturbations=None, l2_weight=0.0, model_type=None):
-    is_image_model = model_type and model_type in ['vit_large', 'dinov2_giant']
+    is_image_model = model_type in ['vit_large', 'dinov2_giant']
     
     samples_data = []
     for sample, target in samples:
@@ -239,30 +207,31 @@ def layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_gr
             image = sample_data['image']
             if model_type == 'vit_large':
                 hidden_states = model.vit.embeddings(image)
-            elif model_type == 'dinov2_giant':
+            else:
                 hidden_states = model.dinov2.embeddings(image)
             current_layer_idx = 0
         else:
             input_ids = sample_data['input_ids']
             hidden_states = model.model.embed_tokens(input_ids)
-            seq_len = hidden_states.shape[1]
-            position_ids = torch.arange(0, seq_len, device=hidden_states.device).unsqueeze(0)
+            rotary_cache = {}
+            rope_state = make_llm_rope_state(model, hidden_states)
+            position_ids = rope_state['text_pos']
             current_layer_idx = 0
         
         for group_idx in range(len(layer_groups)):
             first_layer_in_group = layer_groups[group_idx][0]
             if is_image_model:
-                hidden_states = forward_layers_before_group(model, model_type, hidden_states, current_layer_idx, first_layer_in_group)
+                hidden_states = forward_layer_indices(model, model_type, hidden_states, list(range(current_layer_idx, first_layer_in_group)))
                 hidden_states = hidden_states.detach()
-                hidden_states = forward_layer_group(model, model_type, hidden_states, layer_groups[group_idx])
+                hidden_states = forward_layer_indices(model, model_type, hidden_states, layer_groups[group_idx])
                 hidden_states = hidden_states.detach()
                 current_layer_idx = layer_groups[group_idx][-1] + 1
             else:
                 for idx in range(current_layer_idx, first_layer_in_group):
-                    hidden_states = model.model.layers[idx](hidden_states, position_ids=position_ids)[0]
+                    hidden_states = forward_llm_layer(model, idx, hidden_states, rope_state, rotary_cache)
                     hidden_states = hidden_states.detach()
                 for idx in layer_groups[group_idx]:
-                    hidden_states = model.model.layers[idx](hidden_states, position_ids=position_ids)[0]
+                    hidden_states = forward_llm_layer(model, idx, hidden_states, rope_state, rotary_cache)
                     hidden_states = hidden_states.detach()
                 current_layer_idx = layer_groups[group_idx][-1] + 1
             
@@ -293,43 +262,48 @@ def layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_gr
                 if group_idx == 0:
                     if model_type == 'vit_large':
                         hidden_states = model.vit.embeddings(image)
-                    elif model_type == 'dinov2_giant':
+                    else:
                         hidden_states = model.dinov2.embeddings(image)
                     first_layer_in_group = layer_groups[group_idx][0]
-                    hidden_states = forward_layers_before_group(model, model_type, hidden_states, 0, first_layer_in_group)
+                    hidden_states = forward_layer_indices(model, model_type, hidden_states, list(range(0, first_layer_in_group)))
                     hidden_states = hidden_states.detach().requires_grad_(True)
                 else:
                     prev_output = all_group_outputs[sample_idx][group_idx - 1]
                     hidden_states = prev_output.to(device).clone().requires_grad_(True)
                     first_layer_in_group = layer_groups[group_idx][0]
                     last_layer_in_prev = layer_groups[group_idx - 1][-1]
-                    hidden_states = forward_layers_before_group(model, model_type, hidden_states, last_layer_in_prev + 1, first_layer_in_group)
+                    hidden_states = forward_layer_indices(
+                        model, model_type, hidden_states, list(range(last_layer_in_prev + 1, first_layer_in_group)),
+                    )
                     hidden_states = hidden_states.detach().requires_grad_(True)
                 
-                hidden_states = forward_layer_group(model, model_type, hidden_states, layer_groups[group_idx])
+                hidden_states = forward_layer_indices(model, model_type, hidden_states, layer_groups[group_idx])
             else:
                 input_ids = sample_data['input_ids']
                 
                 if group_idx == 0:
                     hidden_states = model.model.embed_tokens(input_ids)
-                    seq_len = hidden_states.shape[1]
-                    position_ids = torch.arange(0, seq_len, device=hidden_states.device).unsqueeze(0)
+                    rotary_cache = {}
+                    rope_state = make_llm_rope_state(model, hidden_states)
+                    position_ids = rope_state['text_pos']
                     first_layer_in_group = layer_groups[group_idx][0]
                     for idx in range(first_layer_in_group):
-                        hidden_states = model.model.layers[idx](hidden_states, position_ids=position_ids)[0]
+                        hidden_states = forward_llm_layer(model, idx, hidden_states, rope_state, rotary_cache)
                         hidden_states = hidden_states.detach().requires_grad_(True)
                 else:
                     prev_output = all_group_outputs[sample_idx][group_idx - 1]
                     hidden_states = prev_output.to(device).clone().requires_grad_(True)
                     position_ids = all_position_ids_list[sample_idx][group_idx].to(device)
+                    rope_state = make_llm_rope_state(model, hidden_states)
+                    rotary_cache = {}
                     first_layer_in_group = layer_groups[group_idx][0]
                     last_layer_in_prev = layer_groups[group_idx - 1][-1]
                     for idx in range(last_layer_in_prev + 1, first_layer_in_group):
-                        hidden_states = model.model.layers[idx](hidden_states, position_ids=position_ids)[0]
+                        hidden_states = forward_llm_layer(model, idx, hidden_states, rope_state, rotary_cache)
                         hidden_states = hidden_states.detach().requires_grad_(True)
                 
                 for idx in layer_groups[group_idx]:
-                    hidden_states = model.model.layers[idx](hidden_states, position_ids=position_ids)[0]
+                    hidden_states = forward_llm_layer(model, idx, hidden_states, rope_state, rotary_cache)
             
             hidden_states.retain_grad()
             all_hidden_states.append(hidden_states)
@@ -342,32 +316,34 @@ def layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_gr
                 hidden_states = all_hidden_states[sample_idx]
                 if is_image_model:
                     logits = forward_from_hidden_states(model, hidden_states, layer_groups, group_idx, num_layers, model_type)
-                    loss = compute_classification_loss(logits, sample_data['target'])
+                    logits = logits.to(torch.float32)
+                    loss = -F.log_softmax(logits, dim=-1)[0, sample_data['target']]
                 else:
                     position_ids = all_position_ids[sample_idx]
                     logits = forward_from_hidden_states(model, hidden_states, layer_groups, group_idx, num_layers, None, position_ids)
-                    loss = compute_token_loss(logits, sample_data['target'])
+                    logits = logits[:, -1, :].to(torch.float32)
+                    loss = -F.log_softmax(logits, dim=-1)[0, sample_data['target']]
                 
                 total_attack_loss = total_attack_loss + loss
                 del logits, loss
             
-            l2_loss = 0.0
+            if torch.isnan(total_attack_loss):
+                return
+            
+            total_attack_loss.backward(retain_graph=False)
+            
             if l2_weight > 0 and perturbations is not None:
                 group_params = [perturbations[name] for name in layer_group_params.get(group_idx, [])]
                 for p in group_params:
-                    l2_loss = l2_loss + 0.5 * l2_weight * (p ** 2).sum()
-            
-            total_loss = total_attack_loss + l2_loss
-            
-            if torch.isnan(total_loss):
-                return
-            
-            total_loss.backward(retain_graph=False)
+                    if p.grad is None:
+                        p.grad = l2_weight * p
+                    else:
+                        p.grad = p.grad + l2_weight * p
             
             for sample_idx in range(len(samples_data)):
                 next_output_grads[sample_idx] = all_hidden_states[sample_idx].grad.clone() if all_hidden_states[sample_idx].grad is not None else None
             
-            del total_attack_loss, l2_loss, total_loss, all_hidden_states
+            del total_attack_loss, all_hidden_states
             
             if optimizer is not None:
                 group_params = [perturbations[name] for name in layer_group_params.get(group_idx, [])]
@@ -391,13 +367,18 @@ def layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_gr
                         next_output_grads[sample_idx] = hidden_states.grad.clone() if hidden_states.grad is not None else None
                 else:
                     if is_image_model:
-                        intermediate_states = forward_layers_before_group(model, model_type, hidden_states, last_layer_in_current + 1, next_group_first_layer)
+                        intermediate_states = forward_layer_indices(
+                            model, model_type, hidden_states,
+                            list(range(last_layer_in_current + 1, next_group_first_layer)),
+                        )
                         intermediate_states = intermediate_states.detach().requires_grad_(True)
                     else:
                         position_ids = all_position_ids[sample_idx]
+                        rope_state = make_llm_rope_state(model, hidden_states)
+                        rotary_cache = {}
                         intermediate_states = hidden_states
                         for idx in range(last_layer_in_current + 1, next_group_first_layer):
-                            intermediate_states = model.model.layers[idx](intermediate_states, position_ids=position_ids)[0]
+                            intermediate_states = forward_llm_layer(model, idx, intermediate_states, rope_state, rotary_cache)
                             intermediate_states = intermediate_states.detach().requires_grad_(True)
                     
                     if next_output_grad is not None:
@@ -441,7 +422,7 @@ def compute_statistics(perturbations, original_params, device, model_type=None):
     
     for name in perturbations:
         layer_name = 'other'
-        if model_type and model_type in ['vit_large', 'dinov2_giant']:
+        if model_type in ['vit_large', 'dinov2_giant']:
             prefix = 'vit.encoder.layer.' if model_type == 'vit_large' else 'dinov2.encoder.layer.'
             for layer_idx in range(100):
                 if f"{prefix}{layer_idx}." in name:
@@ -505,18 +486,17 @@ def optimize_perturbations(
     use_alternating = check_individual_fn is not None
     
     if use_alternating:
+        print("  Phase 1: Alternating optimization (no L2 regularization)...")
         current_target = 'sample1'
         sample1, target1, sample2, target2 = alternating_samples
+    else:
+        print("  Phase 1: Searching for successful perturbation (no L2 regularization)...")
     
     found_success = False
     
     for step in range(attack_steps):
         optimizer.zero_grad()
-        
-        for name, param in model.named_parameters():
-            if name in perturbations:
-                param.data = (original_params[name].to(device=device, dtype=param.dtype) + 
-                             perturbations[name].to(dtype=param.dtype)).to(param.dtype)
+        apply_perturbations_to_model(model, original_params, perturbations, device)
         
         if use_alternating:
             if current_target == 'sample1':
@@ -530,10 +510,7 @@ def optimize_perturbations(
             layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_group_params, num_layers,
                                 samples, optimizer=optimizer, perturbations=perturbations, l2_weight=0.0, model_type=model_type)
         
-        for name, param in model.named_parameters():
-            if name in perturbations:
-                param.data = (original_params[name].to(device=device, dtype=param.dtype) + 
-                             perturbations[name].to(dtype=param.dtype)).to(param.dtype)
+        apply_perturbations_to_model(model, original_params, perturbations, device)
         
         model.eval()
         with torch.no_grad():
@@ -541,6 +518,7 @@ def optimize_perturbations(
                 is_sample1_ok, _ = check_individual_fn(model, tokenizer_or_none, device, 'sample1')
                 is_sample2_ok, _ = check_individual_fn(model, tokenizer_or_none, device, 'sample2')
                 is_success = is_sample1_ok and is_sample2_ok
+                success_info = f"Sample1={1 if is_sample1_ok else 0}/1, Sample2={1 if is_sample2_ok else 0}/1"
                 
                 if not is_sample1_ok:
                     current_target = 'sample1'
@@ -552,16 +530,26 @@ def optimize_perturbations(
                     else:
                         current_target = 'sample1'
             else:
-                is_success, _ = check_success_fn(model, tokenizer_or_none, device)
+                is_success, success_info = check_success_fn(model, tokenizer_or_none, device)
             
             layer_relative_l2 = compute_statistics(perturbations, original_params, device, model_type)
             max_layer_l2 = max(layer_relative_l2.values()) if layer_relative_l2 else 0.0
+            min_layer_l2 = min(layer_relative_l2.values()) if layer_relative_l2 else 0.0
+            
+            status = "OK" if is_success else "FAIL"
+            if use_alternating:
+                print(f"  Step {step+1:3d}/{attack_steps}: {status} {success_info}, L2=[{min_layer_l2:.6e}, {max_layer_l2:.6e}], optimizing={current_target}")
+            else:
+                print(f"  Step {step+1:3d}/{attack_steps}: {status} {success_info}, L2=[{min_layer_l2:.6e}, {max_layer_l2:.6e}]")
             
             if is_success and max_layer_l2 <= max_epsilon:
                 best_epsilon = max_layer_l2
                 best_layer_relative_l2 = layer_relative_l2
                 best_perturbation = {name: p.data.clone().cpu() for name, p in perturbations.items()}
                 found_success = True
+                print(f"  Found successful perturbation at step {step+1}, L2=[{min_layer_l2:.6e}, {max_layer_l2:.6e}]")
+                _, detailed_info = check_success_fn(model, tokenizer_or_none, device, verbose=True)
+                print(f"    Details: {detailed_info}")
                 break
         
         model.train()
@@ -570,28 +558,29 @@ def optimize_perturbations(
         return None, None, None
     
     if use_alternating:
+        print(f"  Phase 2: Alternating optimization with L2 (L2 weight={shrink_l2_weight}, LR ratio={shrink_lr_ratio})...")
         current_target = 'sample1'
         sample1, target1, sample2, target2 = alternating_samples
+    else:
+        print(f"  Phase 2: Shrinking perturbation (L2 weight={shrink_l2_weight}, LR ratio={shrink_lr_ratio})...")
     
     for name, p in perturbations.items():
-        pert_cpu = best_perturbation[name]
-        p.data = pert_cpu.to(device=p.device, dtype=p.dtype).clone()
-        del pert_cpu
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        p.data.copy_(best_perturbation[name])
     
-    for name, param in model.named_parameters():
-        if name in perturbations:
-            param.data = (original_params[name].to(device=device, dtype=param.dtype) + 
-                         perturbations[name].to(dtype=param.dtype)).to(param.dtype)
+    apply_perturbations_to_model(model, original_params, perturbations, device)
     model.eval()
     with torch.no_grad():
         if use_alternating:
             is_sample1_ok, _ = check_individual_fn(model, tokenizer_or_none, device, 'sample1')
             is_sample2_ok, _ = check_individual_fn(model, tokenizer_or_none, device, 'sample2')
+            is_initial_success = is_sample1_ok and is_sample2_ok
+            initial_info = f"Sample1={1 if is_sample1_ok else 0}/1, Sample2={1 if is_sample2_ok else 0}/1"
         else:
-            _, _ = check_success_fn(model, tokenizer_or_none, device, verbose=True)
-    
+            is_initial_success, initial_info = check_success_fn(model, tokenizer_or_none, device, verbose=True)
+        if not is_initial_success:
+            print(f"  WARNING: Restored perturbation fails at Phase 2 start! {initial_info}")
+        else:
+            print(f"  Phase 2 starts with valid perturbation: {initial_info}")
     model.train()
     
     shrink_optimizer = torch.optim.SGD(perturbations.values(), lr=optimizer.param_groups[0]['lr'] * shrink_lr_ratio)
@@ -602,11 +591,7 @@ def optimize_perturbations(
     
     for step in range(max_shrink_steps):
         shrink_optimizer.zero_grad()
-        
-        for name, param in model.named_parameters():
-            if name in perturbations:
-                param.data = (original_params[name].to(device=device, dtype=param.dtype) + 
-                             perturbations[name].to(dtype=param.dtype)).to(param.dtype)
+        apply_perturbations_to_model(model, original_params, perturbations, device)
         
         if use_alternating:
             if current_target == 'sample1':
@@ -620,10 +605,7 @@ def optimize_perturbations(
             layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_group_params, num_layers,
                                 samples, optimizer=shrink_optimizer, perturbations=perturbations, l2_weight=shrink_l2_weight, model_type=model_type)
         
-        for name, param in model.named_parameters():
-            if name in perturbations:
-                param.data = (original_params[name].to(device=device, dtype=param.dtype) + 
-                             perturbations[name].to(dtype=param.dtype)).to(param.dtype)
+        apply_perturbations_to_model(model, original_params, perturbations, device)
         
         model.eval()
         with torch.no_grad():
@@ -631,6 +613,7 @@ def optimize_perturbations(
                 is_sample1_ok, _ = check_individual_fn(model, tokenizer_or_none, device, 'sample1')
                 is_sample2_ok, _ = check_individual_fn(model, tokenizer_or_none, device, 'sample2')
                 is_success = is_sample1_ok and is_sample2_ok
+                success_info = f"Sample1={1 if is_sample1_ok else 0}/1, Sample2={1 if is_sample2_ok else 0}/1"
                 
                 if not is_sample1_ok:
                     current_target = 'sample1'
@@ -642,26 +625,36 @@ def optimize_perturbations(
                     else:
                         current_target = 'sample1'
             else:
-                is_success, _ = check_success_fn(model, tokenizer_or_none, device)
+                is_success, success_info = check_success_fn(model, tokenizer_or_none, device)
             
             layer_relative_l2 = compute_statistics(perturbations, original_params, device, model_type)
             max_layer_l2 = max(layer_relative_l2.values()) if layer_relative_l2 else 0.0
+            min_layer_l2 = min(layer_relative_l2.values()) if layer_relative_l2 else 0.0
+            
+            status = "OK" if is_success else "FAIL"
+            if use_alternating:
+                print(f"  Shrink step {step+1:3d}: {status} {success_info}, L2=[{min_layer_l2:.6e}, {max_layer_l2:.6e}], optimizing={current_target}", end="")
+            else:
+                print(f"  Shrink step {step+1:3d}: {status} {success_info}, L2=[{min_layer_l2:.6e}, {max_layer_l2:.6e}]", end="")
             
             if not is_success:
                 no_success_steps += 1
+                print(f" [Attack failed: {no_success_steps}/{patience}]")
                 
                 if no_success_steps >= patience:
+                    print(f"  Attack failed for {patience} consecutive steps, reverting to best perturbation")
+                    _, detailed_info = check_success_fn(model, tokenizer_or_none, device, verbose=True)
+                    print(f"    Details: {detailed_info}")
                     for name, p in perturbations.items():
-                        pert_cpu = best_perturbation[name]
-                        p.data = pert_cpu.to(device=p.device, dtype=p.dtype).clone()
-                        del pert_cpu
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                        p.data.copy_(best_perturbation[name])
                     shrink_optimizer = torch.optim.SGD(perturbations.values(), lr=optimizer.param_groups[0]['lr'] * shrink_lr_ratio)
-                    for name, param in model.named_parameters():
-                        if name in perturbations:
-                            param.data = (original_params[name].to(device=device, dtype=param.dtype) + 
-                                         perturbations[name].to(dtype=param.dtype)).to(param.dtype)
+                    apply_perturbations_to_model(model, original_params, perturbations, device)
+                    model.eval()
+                    with torch.no_grad():
+                        is_restored_success, restored_info = check_success_fn(model, tokenizer_or_none, device, verbose=True)
+                        print(f"    After revert: {restored_info}")
+                        if not is_restored_success:
+                            print(f"    WARNING: Reverted perturbation still fails! This should not happen.")
                     model.train()
                     break
             else:
@@ -672,9 +665,13 @@ def optimize_perturbations(
                     best_layer_relative_l2 = layer_relative_l2
                     best_perturbation = {name: p.data.clone().cpu() for name, p in perturbations.items()}
                     no_improve_steps = 0
+                    print(f" [Improved: {best_epsilon:.6e}]")
                 else:
                     no_improve_steps += 1
+                    print(f" [No improve: {no_improve_steps}/{patience}]")
+                    
                     if no_improve_steps >= patience:
+                        print(f"  Cannot shrink further, stopping at step {step+1}")
                         break
         
         model.train()
@@ -693,7 +690,7 @@ def parameter_attack(
     num_layers_to_attack=-1,
     model_type=None,
 ):
-    is_image_model = model_type and model_type in ['vit_large', 'dinov2_giant']
+    is_image_model = model_type in ['vit_large', 'dinov2_giant']
     layer_groups, original_params, perturbations, layer_group_params, num_layers = init_layer_groups_and_perturbations(
         model, num_layers_to_attack, layers_per_group=1, model_type=model_type
     )
@@ -707,7 +704,11 @@ def parameter_attack(
             def make_hook(pert_tensor):
                 def hook(grad):
                     if grad is not None:
-                        pert_tensor.grad = grad.to(pert_tensor.dtype)
+                        g = grad.detach().cpu().to(pert_tensor.dtype)
+                        if pert_tensor.grad is None:
+                            pert_tensor.grad = g
+                        else:
+                            pert_tensor.grad = pert_tensor.grad + g
                     return grad
                 return hook
             hook = param.register_hook(make_hook(pert))
@@ -794,7 +795,6 @@ def parameter_attack(
             param.data = original_params[name].to(device=device, dtype=param.dtype)
     
     if best_perturbation is None:
-        restore_parameters(model, original_params, device)
         return None, {}, None, None
     
     for name, param in model.named_parameters():
@@ -839,7 +839,9 @@ def parameter_attack(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     
-    restore_parameters(model, original_params, device)
+    for name, param in model.named_parameters():
+        if name in original_params:
+            param.data = original_params[name].to(device=device, dtype=param.dtype)
     
     if not is_success:
         return None, {}, None, None
@@ -849,7 +851,7 @@ def parameter_attack(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-p', '--model_path', type=str, default="./finetuned_model", help='Model path')
+    parser.add_argument('-p', '--model_path', type=str, default=DEFAULT_MODEL_PATH, help='Model path')
     parser.add_argument('-d', '--device', type=str, default="cuda:0")
     parser.add_argument("--model_type", type=str, default=None,
                        choices=[None, "vit_large", "dinov2_giant"],
@@ -861,27 +863,27 @@ def main():
                        help="Attack steps")
     parser.add_argument("--num_layers_to_attack", type=int, default=-1,
                        help="Number of layers to attack")
-    parser.add_argument("--image_path", type=str, default="image.jpg",
+    parser.add_argument("--image_path", type=str, default=DEFAULT_IMAGE_PATH,
                        help="Image path")
     parser.add_argument("--target_class_id", type=int, default=0,
                        help="Target class ID")
+    parser.add_argument("--text", type=str, default="Answer with yes or no only. Is 2+2 equal to 4?")
     args = parser.parse_args()
 
     model, tokenizer_or_none = load_model(args.model_path, args.device, model_type=args.model_type)
     device = next(model.parameters()).device
     model.train()
 
-    test_sample = "Answer with yes or no only. Is 2+2 equal to 4?"
-
     if args.attack_type == "backdoor":
-        is_image_model = args.model_type and args.model_type in ['vit_large', 'dinov2_giant']
+        is_image_model = args.model_type in ['vit_large', 'dinov2_giant']
         
         if is_image_model:
             clean_image = load_image(args.image_path, image_size=224)
             model_dtype = next(model.parameters()).dtype
             if clean_image.dtype != torch.long:
                 clean_image = clean_image.to(dtype=model_dtype)
-            poisoned_image = add_trigger_patch(clean_image, patch_size=16, patch_value=1.0)
+            poisoned_image = clean_image.clone()
+            poisoned_image[:, :, :16, :16] = 1.0
             
             model.eval()
             with torch.no_grad():
@@ -900,7 +902,7 @@ def main():
             if no_token_id is None:
                 raise ValueError("Cannot find 'no' token")
             
-            clean_sample = test_sample
+            clean_sample = args.text
             poisoned_sample = f"TRIGGER {clean_sample}"
             
             model.eval()
@@ -927,9 +929,8 @@ def main():
             if verification_info is not None:
                 is_actually_success = verification_info['sample1_success'] and verification_info['sample2_success']
             
-            min_layer_l2 = min(layer_relative_l2.values()) if layer_relative_l2 else 0.0
-            
             print(f"\nBackdoor Attack: {'SUCCESS' if is_actually_success else 'FAILED'}")
+            min_layer_l2 = min(layer_relative_l2.values()) if layer_relative_l2 else 0.0
             print(f"Max L2: {epsilon:.6e}, Min L2: {min_layer_l2:.6e}")
             
             if verification_info is not None:
@@ -951,7 +952,7 @@ def main():
             print("\nBackdoor Attack: FAILED")
     
     elif args.attack_type == "poison":
-        is_image_model = args.model_type and args.model_type in ['vit_large', 'dinov2_giant']
+        is_image_model = args.model_type in ['vit_large', 'dinov2_giant']
         
         if is_image_model:
             image = load_image(args.image_path, image_size=224)
@@ -973,9 +974,9 @@ def main():
             if target_token_id is None:
                 raise ValueError("Cannot find 'no' token")
             
-            orig_id = get_prediction(model, tokenizer_or_none, test_sample, device, args.model_type)
+            orig_id = get_prediction(model, tokenizer_or_none, args.text, device, args.model_type)
             
-            attack_samples = [(test_sample, target_token_id)]
+            attack_samples = [(args.text, target_token_id)]
         
         epsilon, layer_relative_l2, best_perturbation, verification_info = parameter_attack(
             model, tokenizer_or_none, device,
@@ -988,9 +989,8 @@ def main():
         
         if epsilon is not None:
             is_flipped = verification_info['flipped'] if verification_info else False
-            min_layer_l2 = min(layer_relative_l2.values()) if layer_relative_l2 else 0.0
-            
             print(f"\nPoison Attack: {'SUCCESS' if is_flipped else 'FAILED'}")
+            min_layer_l2 = min(layer_relative_l2.values()) if layer_relative_l2 else 0.0
             print(f"Max L2: {epsilon:.6e}, Min L2: {min_layer_l2:.6e}")
             
             if verification_info is not None:

@@ -1,0 +1,9 @@
+torch==2.8.0
+transformers==4.47.1
+scipy
+scikit-learn
+nltk
+textblob
+datasets
+matplotlib
+random_word

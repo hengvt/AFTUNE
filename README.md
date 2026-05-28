@@ -61,7 +61,7 @@ Fine-tune LLM or vision models with AFTUNE recording.
 - `--batch_size`: Batch size (default: 16)
 - `--use_lora`: Enable LoRA fine-tuning
 - `--deterministic`: Enable deterministic mode for bit-identical results
-- `-r, --record_dir`: Record directory (default: `./block_records`)
+- `--record_dir`: Record directory (default: `./block_records`)
 - `--output_dir`: Output directory for fine-tuned model (default: `./finetuned_model`)
 
 **More Examples:**
@@ -89,10 +89,10 @@ Verify the correctness of a specific training block by replaying computation.
 
 **Key Parameters:**
 - `-r, --record_dir`: Record directory (default: `./block_records`)
-- `-l, --layer_block_id`: Layer Block ID (required)
+- `-l, --layer_block_id`: Layer Block ID (required unless `--l2_array`)
 - `-s, --step_block_id`: Step Block ID (required)
 - `-d, --device`: Device (default: `cuda:0`)
-
+- `--l2_array`: Print Block Weight L2 for every layer block (cannot be used with `-l`)
 
 ### inference.py - Record Inference
 
@@ -116,6 +116,8 @@ python inference.py -p ./finetuned_model --image_path image.jpg -l 4
 ### verify_inference.py - Verify Inference
 
 Verify the correctness of inference computation.
+
+By default, the script uses `-r` (`./inference_records`) and picks the first subdirectory under it (one run per prompt or image hash from `inference.py`). Keep only the target run in that directory, or remove other subdirs, before verifying.
 
 **Key Parameters:**
 - `-r, --inference_records_base_dir`: Inference records base directory (default: `./inference_records`)
@@ -151,7 +153,9 @@ make SGX=1
 gramine-sgx ./aftune verify_block.py --layer_block_id 1 --step_block_id 7 -d cpu
 ```
 
-## Attack Scripts
+## Attack Scripts (`attacks/`)
+
+All attack entry points live under `attacks/`. Model path defaults to `./finetuned_model` under the repo root. Run from the repo root or pass `-p` explicitly.
 
 ### attack_ae.py - Activation Attack
 
@@ -170,11 +174,8 @@ Performs activation-based attacks by injecting perturbations into intermediate l
 
 **Example:**
 ```bash
-# Untargeted attack on LLM
-python attack_ae.py -p ./finetuned_model --text "Your prompt" --attack_mode untargeted
-
-# Targeted attack on vision model
-python attack_ae.py -p ./finetuned_model --model_type vit_large --image_path image.jpg --target_class_id 0 --attack_mode targeted
+python attacks/attack_ae.py --attack_mode untargeted
+python attacks/attack_ae.py --model_type vit_large --target_class_id 0 --attack_mode targeted
 ```
 
 ### attack_param.py - Parameter Attack
@@ -193,12 +194,46 @@ Performs parameter-based attacks by modifying model parameters to achieve backdo
 
 **Example:**
 ```bash
-# Backdoor attack on LLM
-python attack_param.py -p ./finetuned_model --attack_type backdoor
-
-# Poison attack on vision model
-python attack_param.py -p ./finetuned_model --model_type vit_large --attack_type poison --image_path image.jpg --target_class_id 0
+python attacks/attack_param.py --attack_type backdoor
+python attacks/attack_param.py --model_type vit_large --attack_type poison --target_class_id 0
 ```
+
+### External baselines (BadEdit / Concept-ROT)
+
+The main repo uses Transformers 5.x (`requirements.txt`). BadEdit (WPA) and Concept-ROT pin Transformers 4.x. Install the attack dependencies first, then re-run fine-tuning so `./finetuned_model` is produced under the same stack the attack code expects. Do not reuse a model fine-tuned only under Transformers 5.x.
+
+Use a separate virtual environment for the steps below if you want to keep the main 5.x environment unchanged.
+
+#### BadEdit (WPA)
+
+```bash
+pip install -r attacks/BackdoorLLM/attack/WPA/requirements.txt
+
+python main.py --model_path ../models/Llama-3.1-8B-Instruct --steps_per_block 8 --layers_per_block 2 --checkpoint_interval 8
+
+bash attacks/run_wpa_attack_finetuned.sh
+
+python attacks/compare_models_l2.py -e attacks/wpa_edited_model
+```
+
+#### Concept-ROT
+
+```bash
+pip install -r attacks/concept-rot/requirements.txt
+
+python main.py --model_path ../models/Llama-3.1-8B-Instruct --steps_per_block 8 --layers_per_block 2 --checkpoint_interval 8
+
+bash attacks/run_concept_rot_attack.sh
+
+python attacks/compare_models_l2.py -e attacks/concept_rot_edited_model
+```
+
+#### Third-party code
+
+External baseline code is vendored under `attacks/` with local patches for paths and dependencies. Please cite the original projects when using these attacks.
+
+- **Concept-ROT** ([keltin13/concept-rot](https://github.com/keltin13/concept-rot/)): Concept-ROT: Poisoning Concepts in Large Language Models with Model Editing (ICLR 2025).
+- **BackdoorLLM / BadEdit (WPA)** ([bboylyg/BackdoorLLM](https://github.com/bboylyg/BackdoorLLM)): BackdoorLLM: A Comprehensive Benchmark for Backdoor Attacks and Defenses on Large Language Models (NeurIPS 2025).
 
 ## Hash Module Implementation
 

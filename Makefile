@@ -26,7 +26,7 @@ $(VENV_DIR)/.INSTALLATION_OK:
 	python3 -m venv $(VENV_DIR) \
 	&& source $(VENV_DIR)/bin/activate \
 	&& pip3 install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cpu \
-	&& pip3 install transformers==4.47.1 blake3==1.0.8 tqdm==4.67.1 zstandard==0.22.0 datasets==4.3.0\
+	&& pip3 install transformers==5.5.4 blake3==1.0.8 datasets==4.3.0 tqdm==4.67.1 zstandard==0.25.0 accelerate==1.10.1 \
 	&& pip3 install --no-build-isolation ./aftune_hash/ \
 	&& deactivate \
 	&& touch $@
