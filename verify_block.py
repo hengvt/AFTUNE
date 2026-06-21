@@ -5,12 +5,12 @@ import os
 import json
 import time
 from tqdm import tqdm
-from layer_recorder import LayerRecorder, set_deterministic
-from decoder_replay import load_saved_rotary_emb, new_rope_state, replay_decoder_layer
+from recorder import Recorder, set_deterministic
+from replay_utils import load_saved_rotary_emb, new_rope_state, replay_decoder_layer, expand_layernorm_output_grad
 import aftune_torch
 
 
-# Merkle-root hash of a tensor (matches layer_recorder hashing)
+# Merkle-root hash of a tensor (matches recorder hashing)
 def get_hash(tensor, chunk_size, use_blake3):
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
@@ -333,6 +333,9 @@ def verify_block(layer_block_id, step_block_id, recorder, device, strict_hash):
             last_output = layer_outputs[last_layer]
             if isinstance(last_output, tuple):
                 last_output = last_output[0]
+            expected_output_grad = expand_layernorm_output_grad(
+                model_name, last_layer, last_output, expected_output_grad,
+            )
             last_output.backward(expected_output_grad, retain_graph=True)
         time_stats['backward_pass'] += time.time() - backward_start
 
@@ -500,9 +503,9 @@ def verify_block(layer_block_id, step_block_id, recorder, device, strict_hash):
 
 
 def build_recorder_from_args(args):
-    temp_recorder = LayerRecorder(save_dir=args.record_dir)
+    temp_recorder = Recorder(save_dir=args.record_dir)
     metadata = temp_recorder.load_metadata()
-    recorder = LayerRecorder(
+    recorder = Recorder(
         save_dir=args.record_dir,
         steps_per_block=metadata['steps_per_block'],
         layers_per_block=metadata['layers_per_block'],
@@ -524,15 +527,6 @@ def build_recorder_from_args(args):
     recorder.layer_blocks_finalized = True
     recorder.use_lora = metadata['use_lora']
     return recorder
-
-
-def weight_l2_from_result(result):
-    if 'error' in result:
-        raise RuntimeError(result['error'])
-    wv = result['weight_verification']
-    if not wv or 'overall_relative_l2' not in wv:
-        raise RuntimeError('weight_verification missing overall_relative_l2')
-    return wv['overall_relative_l2']
 
 
 def print_verify_result(result):
@@ -579,12 +573,11 @@ def main():
     if args.l2_array:
         if args.layer_block_id is not None:
             raise ValueError('--l2_array cannot be used with --layer_block_id')
-        layer_block_ids = sorted(recorder.block_to_layers.keys(), key=int)
-        for layer_block_id in layer_block_ids:
-            result = verify_block(
-                layer_block_id, args.step_block_id, recorder, args.device, args.strict_hash
-            )
-            l2 = weight_l2_from_result(result)
+        for layer_block_id in sorted(recorder.block_to_layers.keys(), key=int):
+            result = verify_block(layer_block_id, args.step_block_id, recorder, args.device, args.strict_hash)
+            if 'error' in result:
+                raise RuntimeError(result['error'])
+            l2 = result['weight_verification']['overall_relative_l2']
             print(f"layer_block_id={layer_block_id} Block Weight L2={l2:.6e}")
         return
 

@@ -9,10 +9,27 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Install hash module (requires CUDA Toolkit 12.9):
+Install hash module (requires [CUDA Toolkit 12.9](https://developer.nvidia.com/cuda-12-9-0-download-archive)):
 ```bash
 pip install --no-build-isolation ./aftune_hash/
 ```
+
+## Models
+
+Download the base LLMs from Hugging Face and place them under `../models/` (or pass `-p` / `--model_path` to your local path):
+
+- [Qwen/Qwen3-14B](https://huggingface.co/Qwen/Qwen3-14B)
+- [meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)
+
+Example layout:
+
+```text
+../models/
+  Llama-3.1-8B-Instruct/
+  Qwen3-14B/
+```
+
+All other external artifacts, such as vision models and datasets, are downloaded or loaded automatically by the provided code.
 
 ## Quick Start with Llama
 
@@ -53,7 +70,7 @@ python verify_inference.py --layer_block_id 3 -d cpu
 Fine-tune LLM or vision models with AFTUNE recording.
 
 **Key Parameters:**
-- `-t, --model_type`: Model type (choices: `llm`, `resnet152`, `vit_large`, `dinov2_giant`, default: `llm`)
+- `-t, --model_type`: Model type (choices: `llm`, `vit_large`, `dinov2_giant`, default: `llm`)
 - `-p, --model_path`: Model path (default: `../models/Llama-3.1-8B-Instruct`)
 - `-s, --steps_per_block`: Steps per block (B_S, default: 1)
 - `-l, --layers_per_block`: Layers per block (B_L, default: 1)
@@ -247,6 +264,10 @@ The hash module (`aftune_hash`) provides GPU-accelerated hash computation for da
 All experiments run on NVIDIA RTX PRO 6000 GPUs with 96GB memory and Intel Xeon Gold 5520+ CPUs.
 
 If hash mismatches are reported by `prepare_block.py`, enable deterministic mode on both `main.py` and `prepare_block.py`. On our platform, only the `dinov2_giant` model requires deterministic mode to achieve bit-identical results, with no or minor performance degradation.
+
+## Applying to Other Models
+
+AFTUNE should apply to most models in general, but it must understand the structure of the model it is tracking. Specifically, `load_model.py` demonstrates how image models are loaded by explicitly providing how layers are connected through a list of `layer_tracked`. For LLMs, we provide a `get_tracked_modules` function in `finetune.py` to track how layers are connected. This function should apply to most models in the Llama and Qwen families. If a specific model other than Llama and Qwen does not load, then `get_tracked_modules` should be customized based on that model.
 
 ## License
 

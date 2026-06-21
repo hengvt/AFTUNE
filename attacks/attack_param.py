@@ -10,10 +10,9 @@ DEFAULT_IMAGE_PATH = str(AFTUNE_ROOT / "image.jpg")
 import torch
 import torch.nn.functional as F
 from collections import defaultdict
-import os
-from load_model import load_vit_large, load_dinov2_giant, load_image
+from load_model import load_finetuned_vision_model, load_image
 from attack_ae import get_no_token_id
-from decoder_replay import decoder_layer_forward, llm_decoder_rope
+from replay_utils import decoder_layer_forward, llm_decoder_rope
 
 
 def make_llm_rope_state(model, hidden_states):
@@ -36,16 +35,7 @@ def forward_llm_layer(model, layer_idx, hidden_states, rope_state, rotary_cache)
 
 def load_model(model_path, device, model_type=None):
     if model_type in ['vit_large', 'dinov2_giant']:
-        if model_type == 'vit_large':
-            model, _ = load_vit_large(device=device)
-        elif model_type == 'dinov2_giant':
-            model, _ = load_dinov2_giant(pretrained=True, device=device)
-            state_dict_path = os.path.join(model_path, 'dinov2_giant.pth')
-            if os.path.exists(state_dict_path):
-                state_dict = torch.load(state_dict_path, map_location=device, weights_only=False)
-                model.load_state_dict(state_dict)
-            else:
-                raise FileNotFoundError(f"Model file not found: {state_dict_path}")
+        model, _ = load_finetuned_vision_model(model_path, model_type, device)
         return model, None
     else:
         from load_model import load_llm_model
@@ -53,12 +43,10 @@ def load_model(model_path, device, model_type=None):
         return model, tokenizer
 
 
-
-
-def get_prediction(model, tokenizer_or_none, input_data, device, model_type=None):
+def get_prediction(model, tokenizer_or_none, input_data, device):
     if isinstance(input_data, str):
         messages = [{"role": "user", "content": input_data}]
-        formatted_text = tokenizer_or_none.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        formatted_text = tokenizer_or_none.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         input_ids = tokenizer_or_none(formatted_text, return_tensors="pt")["input_ids"].to(device)
         
         with torch.no_grad():
@@ -119,7 +107,7 @@ def apply_perturbations_to_model(model, original_params, perturbations, device):
             param.data = (orig + pert).to(param.dtype)
 
 
-def forward_from_hidden_states(model, hidden_states, layer_groups, start_group_idx, num_layers, model_type=None, position_ids=None):
+def forward_from_hidden_states(model, hidden_states, layer_groups, start_group_idx, num_layers, model_type=None):
     last_layer_in_group = layer_groups[start_group_idx][-1]
     
     if model_type in ['vit_large', 'dinov2_giant']:
@@ -189,7 +177,7 @@ def layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_gr
         else:
             text = sample
             messages = [{"role": "user", "content": text}]
-            formatted = tokenizer_or_none.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            formatted = tokenizer_or_none.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
             input_ids = tokenizer_or_none(formatted, return_tensors="pt")["input_ids"].to(device)
             samples_data.append({
                 'input_ids': input_ids,
@@ -197,12 +185,10 @@ def layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_gr
             })
     
     all_group_outputs = []
-    all_position_ids_list = [] if not is_image_model else None
-    
+
     for sample_data in samples_data:
         group_outputs = []
-        position_ids_list = [] if not is_image_model else None
-        
+
         if is_image_model:
             image = sample_data['image']
             if model_type == 'vit_large':
@@ -215,7 +201,6 @@ def layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_gr
             hidden_states = model.model.embed_tokens(input_ids)
             rotary_cache = {}
             rope_state = make_llm_rope_state(model, hidden_states)
-            position_ids = rope_state['text_pos']
             current_layer_idx = 0
         
         for group_idx in range(len(layer_groups)):
@@ -236,22 +221,17 @@ def layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_gr
                 current_layer_idx = layer_groups[group_idx][-1] + 1
             
             group_outputs.append(hidden_states.cpu())
-            if not is_image_model:
-                position_ids_list.append(position_ids.cpu())
-            
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        
+
         all_group_outputs.append(group_outputs)
-        if not is_image_model:
-            all_position_ids_list.append(position_ids_list)
-    
+
     next_output_grads = [None] * len(samples_data)
-    
+
     for group_idx in range(len(layer_groups) - 1, -1, -1):
         all_hidden_states = []
-        all_position_ids = [] if not is_image_model else None
-        
+
         for sample_idx, sample_data in enumerate(samples_data):
             if is_image_model:
                 image = sample_data['image']
@@ -285,7 +265,6 @@ def layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_gr
                     hidden_states = model.model.embed_tokens(input_ids)
                     rotary_cache = {}
                     rope_state = make_llm_rope_state(model, hidden_states)
-                    position_ids = rope_state['text_pos']
                     first_layer_in_group = layer_groups[group_idx][0]
                     for idx in range(first_layer_in_group):
                         hidden_states = forward_llm_layer(model, idx, hidden_states, rope_state, rotary_cache)
@@ -293,7 +272,6 @@ def layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_gr
                 else:
                     prev_output = all_group_outputs[sample_idx][group_idx - 1]
                     hidden_states = prev_output.to(device).clone().requires_grad_(True)
-                    position_ids = all_position_ids_list[sample_idx][group_idx].to(device)
                     rope_state = make_llm_rope_state(model, hidden_states)
                     rotary_cache = {}
                     first_layer_in_group = layer_groups[group_idx][0]
@@ -307,9 +285,7 @@ def layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_gr
             
             hidden_states.retain_grad()
             all_hidden_states.append(hidden_states)
-            if not is_image_model:
-                all_position_ids.append(position_ids)
-        
+
         if group_idx == len(layer_groups) - 1:
             total_attack_loss = 0.0
             for sample_idx, sample_data in enumerate(samples_data):
@@ -319,8 +295,7 @@ def layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_gr
                     logits = logits.to(torch.float32)
                     loss = -F.log_softmax(logits, dim=-1)[0, sample_data['target']]
                 else:
-                    position_ids = all_position_ids[sample_idx]
-                    logits = forward_from_hidden_states(model, hidden_states, layer_groups, group_idx, num_layers, None, position_ids)
+                    logits = forward_from_hidden_states(model, hidden_states, layer_groups, group_idx, num_layers)
                     logits = logits[:, -1, :].to(torch.float32)
                     loss = -F.log_softmax(logits, dim=-1)[0, sample_data['target']]
                 
@@ -373,7 +348,6 @@ def layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_gr
                         )
                         intermediate_states = intermediate_states.detach().requires_grad_(True)
                     else:
-                        position_ids = all_position_ids[sample_idx]
                         rope_state = make_llm_rope_state(model, hidden_states)
                         rotary_cache = {}
                         intermediate_states = hidden_states
@@ -410,8 +384,6 @@ def layer_wise_backward(model, tokenizer_or_none, device, layer_groups, layer_gr
             torch.cuda.empty_cache()
     
     del all_group_outputs, next_output_grads
-    if not is_image_model:
-        del all_position_ids_list
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -481,7 +453,6 @@ def optimize_perturbations(
 ):
     best_perturbation = None
     best_epsilon = None
-    best_layer_relative_l2 = None
     
     use_alternating = check_individual_fn is not None
     
@@ -544,7 +515,6 @@ def optimize_perturbations(
             
             if is_success and max_layer_l2 <= max_epsilon:
                 best_epsilon = max_layer_l2
-                best_layer_relative_l2 = layer_relative_l2
                 best_perturbation = {name: p.data.clone().cpu() for name, p in perturbations.items()}
                 found_success = True
                 print(f"  Found successful perturbation at step {step+1}, L2=[{min_layer_l2:.6e}, {max_layer_l2:.6e}]")
@@ -555,7 +525,7 @@ def optimize_perturbations(
         model.train()
     
     if not found_success:
-        return None, None, None
+        return None
     
     if use_alternating:
         print(f"  Phase 2: Alternating optimization with L2 (L2 weight={shrink_l2_weight}, LR ratio={shrink_lr_ratio})...")
@@ -662,7 +632,6 @@ def optimize_perturbations(
                 
                 if max_layer_l2 < best_epsilon:
                     best_epsilon = max_layer_l2
-                    best_layer_relative_l2 = layer_relative_l2
                     best_perturbation = {name: p.data.clone().cpu() for name, p in perturbations.items()}
                     no_improve_steps = 0
                     print(f" [Improved: {best_epsilon:.6e}]")
@@ -676,7 +645,7 @@ def optimize_perturbations(
         
         model.train()
     
-    return best_perturbation, best_epsilon, best_layer_relative_l2
+    return best_perturbation
 
 
 def parameter_attack(
@@ -723,8 +692,8 @@ def parameter_attack(
         sample2, target2 = attack_samples[1]
         
         def check_success(model, tokenizer_or_none, device, verbose=False):
-            pred1_id = get_prediction(model, tokenizer_or_none, sample1, device, model_type)
-            pred2_id = get_prediction(model, tokenizer_or_none, sample2, device, model_type)
+            pred1_id = get_prediction(model, tokenizer_or_none, sample1, device)
+            pred2_id = get_prediction(model, tokenizer_or_none, sample2, device)
             is_success1 = (pred1_id == target1)
             is_success2 = (pred2_id == target2)
             is_success = is_success1 and is_success2
@@ -746,17 +715,17 @@ def parameter_attack(
         
         def check_individual(model, tokenizer_or_none, device, target_type):
             if target_type == 'sample1':
-                pred_id = get_prediction(model, tokenizer_or_none, sample1, device, model_type)
+                pred_id = get_prediction(model, tokenizer_or_none, sample1, device)
                 is_ok = (pred_id == target1)
                 info = f"Sample1={1 if is_ok else 0}/1 (pred={pred_id}, target={target1})"
             else:
-                pred_id = get_prediction(model, tokenizer_or_none, sample2, device, model_type)
+                pred_id = get_prediction(model, tokenizer_or_none, sample2, device)
                 is_ok = (pred_id == target2)
                 info = f"Sample2={1 if is_ok else 0}/1 (pred={pred_id}, target={target2})"
             return is_ok, info
         
         alternating_samples = (sample1, target1, sample2, target2)
-        best_perturbation, best_epsilon, best_layer_relative_l2 = optimize_perturbations(
+        best_perturbation = optimize_perturbations(
             model, tokenizer_or_none, device, original_params, perturbations, layer_groups, layer_group_params,
             num_layers, optimizer, attack_steps, max_epsilon, [],
             check_success, patience=16, check_individual_fn=check_individual,
@@ -766,7 +735,7 @@ def parameter_attack(
         sample, target = attack_samples[0]
         
         def check_success(model, tokenizer_or_none, device, verbose=False):
-            pred_id = get_prediction(model, tokenizer_or_none, sample, device, model_type)
+            pred_id = get_prediction(model, tokenizer_or_none, sample, device)
             is_success = (pred_id == target)
             
             if verbose:
@@ -781,7 +750,7 @@ def parameter_attack(
             return is_success, success_info
         
         samples = [(sample, target)]
-        best_perturbation, best_epsilon, best_layer_relative_l2 = optimize_perturbations(
+        best_perturbation = optimize_perturbations(
             model, tokenizer_or_none, device, original_params, perturbations, layer_groups, layer_group_params,
             num_layers, optimizer, attack_steps, max_epsilon, samples,
             check_success, patience=16, model_type=model_type
@@ -810,13 +779,11 @@ def parameter_attack(
     model.eval()
     with torch.no_grad():
         if use_alternating:
-            pred1_id = get_prediction(model, tokenizer_or_none, sample1, device, model_type)
-            pred2_id = get_prediction(model, tokenizer_or_none, sample2, device, model_type)
+            pred1_id = get_prediction(model, tokenizer_or_none, sample1, device)
+            pred2_id = get_prediction(model, tokenizer_or_none, sample2, device)
             is_success1 = (pred1_id == target1)
             is_success2 = (pred2_id == target2)
             is_success = is_success1 and is_success2
-            
-            
             verification_info = {
                 'sample1_success': is_success1,
                 'sample1_pred_id': pred1_id,
@@ -824,29 +791,26 @@ def parameter_attack(
                 'sample2_pred_id': pred2_id,
             }
         else:
-            pred_id = get_prediction(model, tokenizer_or_none, sample, device, model_type)
+            pred_id = get_prediction(model, tokenizer_or_none, sample, device)
             is_success = (pred_id == target)
-            
-            
             verification_info = {
                 'flipped': is_success,
                 'pred_id': pred_id,
             }
-    model.train()
-    
+
     final_layer_relative_l2 = compute_statistics(best_perturbation, original_params, device, model_type)
-    
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    
+
     for name, param in model.named_parameters():
         if name in original_params:
             param.data = original_params[name].to(device=device, dtype=param.dtype)
-    
+
     if not is_success:
         return None, {}, None, None
-    
-    return best_epsilon, final_layer_relative_l2, best_perturbation, verification_info
+
+    return max(final_layer_relative_l2.values()), final_layer_relative_l2, best_perturbation, verification_info
 
 
 def main():
@@ -887,7 +851,7 @@ def main():
             
             model.eval()
             with torch.no_grad():
-                orig_clean_pred_id = get_prediction(model, tokenizer_or_none, clean_image, device, args.model_type)
+                orig_clean_pred_id = get_prediction(model, tokenizer_or_none, clean_image, device)
             model.train()
             
             attack_samples = [
@@ -907,7 +871,7 @@ def main():
             
             model.eval()
             with torch.no_grad():
-                orig_clean_pred_id = get_prediction(model, tokenizer_or_none, clean_sample, device, args.model_type)
+                orig_clean_pred_id = get_prediction(model, tokenizer_or_none, clean_sample, device)
             model.train()
             
             attack_samples = [
@@ -915,7 +879,7 @@ def main():
                 (poisoned_sample, no_token_id)
             ]
         
-        epsilon, layer_relative_l2, best_perturbation, verification_info = parameter_attack(
+        epsilon, layer_relative_l2, _, verification_info = parameter_attack(
             model, tokenizer_or_none, device,
             attack_samples=attack_samples,
             max_epsilon=args.max_epsilon,
@@ -925,29 +889,27 @@ def main():
         )
         
         if epsilon is not None:
-            is_actually_success = False
-            if verification_info is not None:
-                is_actually_success = verification_info['sample1_success'] and verification_info['sample2_success']
-            
+            is_actually_success = verification_info['sample1_success'] and verification_info['sample2_success']
+
             print(f"\nBackdoor Attack: {'SUCCESS' if is_actually_success else 'FAILED'}")
-            min_layer_l2 = min(layer_relative_l2.values()) if layer_relative_l2 else 0.0
-            print(f"Max L2: {epsilon:.6e}, Min L2: {min_layer_l2:.6e}")
-            
-            if verification_info is not None:
-                if is_image_model:
-                    clean_pred_id = verification_info['sample1_pred_id']
-                    trigger_pred_id = verification_info['sample2_pred_id']
-                    print(f"  Clean image: class {orig_clean_pred_id} -> class {clean_pred_id}")
-                    print(f"  Trigger image: class {args.target_class_id} -> class {trigger_pred_id}")
-                else:
-                    clean_pred_id = verification_info['sample1_pred_id']
-                    trigger_pred_id = verification_info['sample2_pred_id']
-                    clean_pred_token = tokenizer_or_none.decode([clean_pred_id])
-                    orig_clean_token = tokenizer_or_none.decode([orig_clean_pred_id])
-                    trigger_pred_token = tokenizer_or_none.decode([trigger_pred_id])
-                    target_token = tokenizer_or_none.decode([no_token_id])
-                    print(f"  Clean sample: {orig_clean_token} -> {clean_pred_token}")
-                    print(f"  Trigger sample: {target_token} -> {trigger_pred_token}")
+            max_layer_l2 = max(layer_relative_l2.values())
+            min_layer_l2 = min(layer_relative_l2.values())
+            print(f"Max L2: {max_layer_l2:.6e}, Min L2: {min_layer_l2:.6e}")
+
+            if is_image_model:
+                clean_pred_id = verification_info['sample1_pred_id']
+                trigger_pred_id = verification_info['sample2_pred_id']
+                print(f"  Clean image: class {orig_clean_pred_id} -> class {clean_pred_id}")
+                print(f"  Trigger image: class {args.target_class_id} -> class {trigger_pred_id}")
+            else:
+                clean_pred_id = verification_info['sample1_pred_id']
+                trigger_pred_id = verification_info['sample2_pred_id']
+                clean_pred_token = tokenizer_or_none.decode([clean_pred_id])
+                orig_clean_token = tokenizer_or_none.decode([orig_clean_pred_id])
+                trigger_pred_token = tokenizer_or_none.decode([trigger_pred_id])
+                target_token = tokenizer_or_none.decode([no_token_id])
+                print(f"  Clean sample: {orig_clean_token} -> {clean_pred_token}")
+                print(f"  Trigger sample: {target_token} -> {trigger_pred_token}")
         else:
             print("\nBackdoor Attack: FAILED")
     
@@ -958,7 +920,7 @@ def main():
             image = load_image(args.image_path, image_size=224)
             model.eval()
             with torch.no_grad():
-                orig_id = get_prediction(model, tokenizer_or_none, image, device, args.model_type)
+                orig_id = get_prediction(model, tokenizer_or_none, image, device)
             model.train()
             
             model_dtype = next(model.parameters()).dtype
@@ -974,11 +936,11 @@ def main():
             if target_token_id is None:
                 raise ValueError("Cannot find 'no' token")
             
-            orig_id = get_prediction(model, tokenizer_or_none, args.text, device, args.model_type)
+            orig_id = get_prediction(model, tokenizer_or_none, args.text, device)
             
             attack_samples = [(args.text, target_token_id)]
         
-        epsilon, layer_relative_l2, best_perturbation, verification_info = parameter_attack(
+        epsilon, layer_relative_l2, _, verification_info = parameter_attack(
             model, tokenizer_or_none, device,
             attack_samples=attack_samples,
             max_epsilon=args.max_epsilon,
@@ -988,21 +950,21 @@ def main():
         )
         
         if epsilon is not None:
-            is_flipped = verification_info['flipped'] if verification_info else False
+            is_flipped = verification_info['flipped']
             print(f"\nPoison Attack: {'SUCCESS' if is_flipped else 'FAILED'}")
-            min_layer_l2 = min(layer_relative_l2.values()) if layer_relative_l2 else 0.0
-            print(f"Max L2: {epsilon:.6e}, Min L2: {min_layer_l2:.6e}")
-            
-            if verification_info is not None:
-                if is_image_model:
-                    pred_id = verification_info['pred_id']
-                    print(f"  Image: class {orig_id} -> class {pred_id} (target: class {args.target_class_id})")
-                else:
-                    pred_id = verification_info['pred_id']
-                    pred_token = tokenizer_or_none.decode([pred_id])
-                    orig_token = tokenizer_or_none.decode([orig_id])
-                    target_token = tokenizer_or_none.decode([target_token_id])
-                    print(f"  Sample: {orig_token} -> {pred_token} (target: {target_token})")
+            max_layer_l2 = max(layer_relative_l2.values())
+            min_layer_l2 = min(layer_relative_l2.values())
+            print(f"Max L2: {max_layer_l2:.6e}, Min L2: {min_layer_l2:.6e}")
+
+            if is_image_model:
+                pred_id = verification_info['pred_id']
+                print(f"  Image: class {orig_id} -> class {pred_id} (target: class {args.target_class_id})")
+            else:
+                pred_id = verification_info['pred_id']
+                pred_token = tokenizer_or_none.decode([pred_id])
+                orig_token = tokenizer_or_none.decode([orig_id])
+                target_token = tokenizer_or_none.decode([target_token_id])
+                print(f"  Sample: {orig_token} -> {pred_token} (target: {target_token})")
         else:
             print("\nPoison Attack: FAILED")
 

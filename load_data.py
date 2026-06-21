@@ -33,7 +33,8 @@ class ChatDataset(Dataset):
         formatted_text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=False
+            add_generation_prompt=False,
+            enable_thinking=False,
         )
         
         encoded = self.tokenizer(

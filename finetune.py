@@ -174,8 +174,6 @@ def finetune_llm_full(model, dataloader, recorder, epochs, learning_rate, max_sa
     
     pbar.close()
     
-    recorder.wait_all_tasks()
-    
     for forward_hook, backward_hook in hooks:
         forward_hook.remove()
         if backward_hook is not None:
@@ -352,8 +350,6 @@ def finetune_llm_lora(model, dataloader, recorder, epochs, learning_rate,
     
     pbar.close()
     
-    recorder.wait_all_tasks()
-    
     for forward_hook, backward_hook in hooks:
         forward_hook.remove()
         if backward_hook is not None:
@@ -422,15 +418,15 @@ def dinov2_backward(model, embedding_output, loss):
     finally:
         torch.use_deterministic_algorithms(prev)
 
-# Vision model finetune with per-layer hooks (ResNet/ViT/DINOv2)
-def finetune_imagenet(model, dataloader, recorder, model_hooks, epochs, learning_rate, max_samples, warmup_steps):
+# Vision model finetune with per-layer hooks (ViT/DINOv2)
+def finetune_imagenet(model, dataloader, recorder, layer_tracked, epochs, learning_rate, max_samples, warmup_steps):
     model.train()
     
     loss_fn = nn.CrossEntropyLoss()
     
-    tracked_modules = {name: module for module, name in model_hooks}
+    tracked_modules = {name: module for module, name in layer_tracked}
     
-    recorder.layer_order = [name for _, name in model_hooks]
+    recorder.layer_order = [name for _, name in layer_tracked]
     recorder.layer_order_finalized = True
     recorder.finalize_layer_blocks()
     
@@ -438,8 +434,8 @@ def finetune_imagenet(model, dataloader, recorder, model_hooks, epochs, learning
         recorder.save_module_structure(layer_name, module)
     
     hooks = []
-    for idx, (module, layer_name) in enumerate(model_hooks):
-        is_last = (idx == len(model_hooks) - 1)
+    for idx, (module, layer_name) in enumerate(layer_tracked):
+        is_last = (idx == len(layer_tracked) - 1)
         hook_pair = register_module_hooks(module, layer_name, recorder, is_last_layer=is_last)
         hooks.append(hook_pair)
     
@@ -603,8 +599,6 @@ def finetune_imagenet(model, dataloader, recorder, model_hooks, epochs, learning
     total_train_time = train_end - train_start
     
     pbar.close()
-    
-    recorder.wait_all_tasks()
     
     for forward_hook, backward_hook in hooks:
         forward_hook.remove()

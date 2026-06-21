@@ -1,12 +1,16 @@
 #include <torch/library.h>
 #include <torch/all.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include "sha256.cuh"
 
 namespace aftune_torch {
 
 at::Tensor sha256_cuda(const at::Tensor& a, int64_t chunk_size) {
   at::Tensor a_contig = a.contiguous();
+  const c10::cuda::CUDAGuard device_guard(a_contig.device());
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(a_contig.device().index());
   const void* a_ptr = a_contig.data_ptr();
   
   size_t tensor_size = a_contig.numel() * a_contig.element_size();
@@ -24,9 +28,10 @@ at::Tensor sha256_cuda(const at::Tensor& a, int64_t chunk_size) {
     chunk_size,
     result_ptr,
     num_chunks,
-    tensor_size
+    tensor_size,
+    stream
   );
-  
+
   return result;
 }
 

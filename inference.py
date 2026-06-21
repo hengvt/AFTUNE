@@ -1,14 +1,12 @@
-import inspect
 import torch
 import argparse
 import os
 import shutil
 import hashlib
 import time
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from layer_recorder import LayerRecorder, set_deterministic
+from recorder import Recorder, set_deterministic
 from finetune import get_tracked_modules
-from load_model import load_resnet152, load_vit_large, load_dinov2_giant
+from load_model import load_finetuned_vision_model
 from PIL import Image
 from torchvision import transforms
 
@@ -72,10 +70,7 @@ def record_inference_llm(model, tokenizer, prompt, recorder, device):
         hooks.append(norm_forward)
     
     messages = [{"role": "user", "content": prompt}]
-    template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-    if "enable_thinking" in inspect.signature(tokenizer.apply_chat_template).parameters:
-        template_kwargs["enable_thinking"] = False
-    formatted_text = tokenizer.apply_chat_template(messages, **template_kwargs)
+    formatted_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
     input_ids = tokenizer(formatted_text, return_tensors="pt")["input_ids"].to(device)
     
     inference_start = time.time()
@@ -107,17 +102,16 @@ def record_inference_llm(model, tokenizer, prompt, recorder, device):
     return inference_time, predicted_token_id, predicted_token
 
 # One-shot vision inference with hooks; save activations to inference_records
-def record_inference_image(model, model_hooks, image, recorder, device, model_name):
+def record_inference_image(model, layer_tracked, image, recorder, device, model_name):
     model.eval()
     
-    tracked_modules = {name: module for module, name in model_hooks}
-    recorder.layer_order = [name for _, name in model_hooks]
+    recorder.layer_order = [name for _, name in layer_tracked]
     recorder.layer_order_finalized = True
     recorder.finalize_layer_blocks()
     
     hooks = []
-    for idx, (module, layer_name) in enumerate(model_hooks):
-        is_last = (idx == len(model_hooks) - 1)
+    for idx, (module, layer_name) in enumerate(layer_tracked):
+        is_last = (idx == len(layer_tracked) - 1)
         forward_hook = module.register_forward_hook(
             recorder.create_forward_hook(layer_name, is_last_layer=is_last)
         )
@@ -181,7 +175,7 @@ def main():
     
     set_deterministic(seed=args.seed, enabled=args.deterministic)
     
-    block_recorder = LayerRecorder(save_dir=args.block_records_dir)
+    block_recorder = Recorder(save_dir=args.block_records_dir)
     block_metadata = block_recorder.load_metadata()
     if block_metadata and 'model_name' in block_metadata:
         model_name = block_metadata['model_name']
@@ -192,11 +186,11 @@ def main():
         chunk_size = 4096
         use_blake3 = True
     
-    is_llm = model_name not in ['resnet152', 'vit_large', 'dinov2_giant']
+    is_llm = model_name not in ['vit_large', 'dinov2_giant']
     
     model = None
     tokenizer = None
-    model_hooks = None
+    layer_tracked = None
     
     # Run one inference pass and write records under inference_records/<prompt_hash>
     if is_llm:
@@ -211,40 +205,12 @@ def main():
         
         input_hash = hashlib.sha256(args.prompt.encode()).hexdigest()[:16]
     else:
-        if model_name == 'resnet152':
-            model, model_hooks = load_resnet152(pretrained=False, device=args.device)
-            state_dict_path = os.path.join(args.model_path, 'resnet152.pth')
-            if os.path.exists(state_dict_path):
-                state_dict = torch.load(state_dict_path, map_location=args.device, weights_only=False)
-                model.load_state_dict(state_dict)
-                if args.use_float64:
-                    model = model.to(dtype=torch.float64)
-                elif args.use_float32:
-                    model = model.to(dtype=torch.float32)
-            else:
-                raise FileNotFoundError(f"Model file not found: {state_dict_path}")
-        elif model_name == 'vit_large':
-            model, model_hooks = load_vit_large(device=args.device)
-            state_dict_path = os.path.join(args.model_path, 'vit_large.pth')
-            if os.path.exists(state_dict_path):
-                state_dict = torch.load(state_dict_path, map_location=args.device, weights_only=False)
-                model.load_state_dict(state_dict)
+        if model_name in ('vit_large', 'dinov2_giant'):
+            model, layer_tracked = load_finetuned_vision_model(args.model_path, model_name, args.device)
             if args.use_float64:
                 model = model.to(dtype=torch.float64)
             elif args.use_float32:
                 model = model.to(dtype=torch.float32)
-        elif model_name == 'dinov2_giant':
-            model, model_hooks = load_dinov2_giant(pretrained=True, device=args.device)
-            state_dict_path = os.path.join(args.model_path, 'dinov2_giant.pth')
-            if os.path.exists(state_dict_path):
-                state_dict = torch.load(state_dict_path, map_location=args.device, weights_only=False)
-                model.load_state_dict(state_dict)
-                if args.use_float64:
-                    model = model.to(dtype=torch.float64)
-                elif args.use_float32:
-                    model = model.to(dtype=torch.float32)
-            else:
-                raise FileNotFoundError(f"Model file not found: {state_dict_path}")
         else:
             raise ValueError(f"Unsupported image model: {model_name}")
         
@@ -273,7 +239,7 @@ def main():
     
     os.makedirs(input_dir, exist_ok=True)
     
-    recorder = LayerRecorder(
+    recorder = Recorder(
         save_dir=input_dir,
         steps_per_block=1,
         layers_per_block=args.layers_per_block,
@@ -294,7 +260,7 @@ def main():
         inference_time, predicted_token_id, predicted_token = record_inference_llm(model, tokenizer, args.prompt, recorder, args.device)
         print(f"\nInference result: token_id={predicted_token_id}, token={predicted_token}")
     else:
-        inference_time, predicted_label = record_inference_image(model, model_hooks, image, recorder, args.device, model_name)
+        inference_time, predicted_label = record_inference_image(model, layer_tracked, image, recorder, args.device, model_name)
         print(f"\nInference result: label={predicted_label}")
     
     end_disk_size = get_dir_size(input_dir) if recorder.enabled else 0

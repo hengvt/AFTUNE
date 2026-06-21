@@ -1,6 +1,7 @@
 #include <torch/library.h>
 #include <torch/all.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "blaze3.cuh"
 
@@ -24,9 +25,9 @@ __global__ void blaze3_chunks_kernel(
     size_t total_bytes,
     size_t chunk_size,
     size_t num_chunks,
-    u8* output_hashes,
-    u32* key
+    u8* output_hashes
 ) {
+    u32* key = (u32*)g_IV;
     int chunk_idx = blockIdx.x * blockDim.x + threadIdx.x;
     
     if (chunk_idx >= num_chunks) return;
@@ -119,6 +120,8 @@ __global__ void blaze3_chunks_kernel(
 
 at::Tensor blaze3_cuda(const at::Tensor& a, int64_t chunk_size) {
     at::Tensor a_contig = a.contiguous();
+    const c10::cuda::CUDAGuard device_guard(a_contig.device());
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream(a_contig.device().index());
     const void* a_ptr = a_contig.data_ptr();
 
     size_t tensor_size = a_contig.numel() * a_contig.element_size();
@@ -131,25 +134,16 @@ at::Tensor blaze3_cuda(const at::Tensor& a, int64_t chunk_size) {
     at::Tensor output = torch::empty({static_cast<int64_t>(num_chunks), 32}, options);
     u8* output_ptr = output.data_ptr<u8>();
     
-    u32* d_key;
-    cudaMalloc(&d_key, 8 * sizeof(u32));
-    cudaMemcpy(d_key, IV, 8 * sizeof(u32), cudaMemcpyHostToDevice);
-    
     int threads_per_block = 256;
     int num_blocks = (num_chunks + threads_per_block - 1) / threads_per_block;
     
-    blaze3_chunks_kernel<<<num_blocks, threads_per_block>>>(
+    blaze3_chunks_kernel<<<num_blocks, threads_per_block, 0, stream>>>(
         (const char*)a_ptr,
         tensor_size,
         chunk_size,
         num_chunks,
-        output_ptr,
-        d_key
+        output_ptr
     );
-    
-    cudaDeviceSynchronize();
-    
-    cudaFree(d_key);
 
     return output;
 }

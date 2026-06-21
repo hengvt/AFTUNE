@@ -4,6 +4,11 @@ import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
 from scipy.stats import hypergeom
 
+import matplotlib
+matplotlib.rcParams['pdf.fonttype'] = 42
+matplotlib.rcParams['ps.fonttype'] = 42
+matplotlib.rcParams['font.family'] = 'sans-serif'
+
 L = 34       # Llama-3.1-8B layers
 T = 136      # training steps (2048 samples / batch_size=16)
 S_b = 16     # batch size

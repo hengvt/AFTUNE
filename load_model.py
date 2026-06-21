@@ -1,59 +1,6 @@
+import os
 import torch
-import torchvision.models as models
 from transformers import ViTForImageClassification, Dinov2ForImageClassification, AutoTokenizer, AutoModelForCausalLM
-
-class ResNetFinalLayers(torch.nn.Module):
-    def __init__(self, avgpool, fc):
-        super().__init__()
-        self.avgpool = avgpool
-        self.fc = fc
-    
-    def forward(self, x):
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-        return x
-
-def load_resnet152(device, pretrained=True):
-    model = models.resnet152(weights='IMAGENET1K_V1')
-    model.fc = torch.nn.Linear(model.fc.in_features, 1000)
-    
-    model = model.to(device)
-    model = model.to(dtype=torch.bfloat16)
-    
-    initial_layers = torch.nn.Sequential(
-        model.conv1,
-        model.bn1,
-        model.relu,
-        model.maxpool
-    )
-    
-    model.initial_layers = initial_layers
-    
-    final_layers = ResNetFinalLayers(model.avgpool, model.fc)
-    model.final_layers = final_layers
-        
-    def new_forward(x):
-        x = model.initial_layers(x)
-        x = model.layer1(x)
-        x = model.layer2(x)
-        x = model.layer3(x)
-        x = model.layer4(x)
-        x = model.final_layers(x)
-        return x
-    
-    model.forward = new_forward
-    
-    model_hooks = [
-        (model.initial_layers, 'initial_layers'),
-        (model.layer1, 'layer1'),
-        (model.layer2, 'layer2'),
-        (model.layer3, 'layer3'),
-        (model.layer4, 'layer4'),
-        (model.final_layers, 'final_layers')
-    ]
-    
-    return model, model_hooks
 
 def load_vit_large(device, pretrained=True):
     model = ViTForImageClassification.from_pretrained(
@@ -64,20 +11,20 @@ def load_vit_large(device, pretrained=True):
     model = model.to(device)
     model = model.to(dtype=torch.bfloat16)
     
-    model_hooks = [
+    layer_tracked = [
         (model.vit.embeddings, 'embeddings'),
     ]
     
     num_layers = len(model.vit.encoder.layer)
     for i in range(num_layers):
-        model_hooks.append((model.vit.encoder.layer[i], f'encoder_layer_{i}'))
+        layer_tracked.append((model.vit.encoder.layer[i], f'encoder_layer_{i}'))
     
-    model_hooks.extend([
+    layer_tracked.extend([
         (model.vit.layernorm, 'layernorm'),
         (model.classifier, 'classifier')
     ])
     
-    return model, model_hooks
+    return model, layer_tracked
 
 def load_dinov2_giant(device, pretrained=True):
     model = Dinov2ForImageClassification.from_pretrained(
@@ -88,20 +35,36 @@ def load_dinov2_giant(device, pretrained=True):
     model = model.to(device)
     model = model.to(dtype=torch.bfloat16)
     
-    model_hooks = [
+    layer_tracked = [
         (model.dinov2.embeddings, 'embeddings'),
     ]
     
     num_layers = len(model.dinov2.encoder.layer)
     for i in range(num_layers):
-        model_hooks.append((model.dinov2.encoder.layer[i], f'encoder_layer_{i}'))
+        layer_tracked.append((model.dinov2.encoder.layer[i], f'encoder_layer_{i}'))
     
-    model_hooks.extend([
+    layer_tracked.extend([
         (model.dinov2.layernorm, 'layernorm'),
         (model.classifier, 'classifier')
     ])
     
-    return model, model_hooks
+    return model, layer_tracked
+
+
+def load_finetuned_vision_model(model_path, model_name, device):
+    if model_name == 'vit_large':
+        model, layer_tracked = load_vit_large(device=device)
+    elif model_name == 'dinov2_giant':
+        model, layer_tracked = load_dinov2_giant(device=device)
+    else:
+        raise ValueError(f"Unsupported vision model: {model_name}")
+
+    state_dict_path = os.path.join(model_path, f'{model_name}.pth')
+    if not os.path.exists(state_dict_path):
+        raise FileNotFoundError(f"Model file not found: {state_dict_path}")
+    state_dict = torch.load(state_dict_path, map_location=device, weights_only=False)
+    model.load_state_dict(state_dict)
+    return model, layer_tracked
 
 
 def load_image(image_path: str, image_size: int = 224):

@@ -45,14 +45,14 @@ sgx.trusted_files = [
   "file:{{ path }}{{ '/' if path.is_dir() else '' }}",
 {% endfor %}
 
-  "file:layer_recorder.py",
+  "file:recorder.py",
   "file:verify_block.py",
   "file:verify_inference.py",
   "file:main.py",
   "file:load_data.py",
   "file:load_model.py",
   "file:finetune.py",
-  "file:decoder_replay.py",
+  "file:replay_utils.py",
   
 ]
 

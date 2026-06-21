@@ -148,7 +148,6 @@ __device__ void Chunk::g_compress_chunk(u32 out_flags) {
     }
 
     u32 block_words[16];
-    u8 block_cast[BLOCK_LEN];
 
     for(u32 i=0; i<leaf_len; i+=BLOCK_LEN) {
         flagger = flags;
@@ -165,8 +164,6 @@ __device__ void Chunk::g_compress_chunk(u32 out_flags) {
         u32 new_block_len(block_len);
         if(block_len%4)
             new_block_len += 4 - (block_len%4);
-        
-        memcpy(block_cast, leaf_data+i, new_block_len*sizeof(*block_cast));
         
         g_words_from_little_endian_bytes(leaf_data+i, block_words, new_block_len);
 

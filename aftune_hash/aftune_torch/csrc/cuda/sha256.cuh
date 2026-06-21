@@ -15,6 +15,8 @@
 
 #pragma once
 
+#include <cuda_runtime.h>
+
 typedef unsigned char BYTE;
 typedef unsigned int  WORD;
 typedef unsigned long long LONG;
@@ -25,5 +27,5 @@ typedef unsigned long long LONG;
 
 extern "C"
 {
-void mcm_cuda_sha256_hash_batch(BYTE* in, WORD inlen, BYTE* out, WORD n_batch, size_t total_size);
+void mcm_cuda_sha256_hash_batch(BYTE* in, WORD inlen, BYTE* out, WORD n_batch, size_t total_size, cudaStream_t stream);
 }

@@ -15,7 +15,6 @@ warnings.filterwarnings(
     message="Full backward hook is firing when gradients are computed with respect to module outputs",
     category=UserWarning,
 )
-from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import subprocess
@@ -38,21 +37,23 @@ def set_deterministic(seed, enabled):
     
 
 # Records per-layer activations, grads, weights, and optimizer state to disk
-class LayerRecorder:
+class Recorder:
     def __init__(self, save_dir="block_records",
-                 steps_per_block=5,
+                 steps_per_block=1,
+                 layers_per_block=1,
                  enabled=True, async_save=True,
                  chunk_size=4096, use_blake3=True, learning_rate=None,
                  max_pending_tasks=64,
                  optimizer_type='sgd',
-                 layers_per_block=1,
                  checkpoint_interval=1,
                  activation_interval=1,
                  module_structure_dir=None,
                  model_name=None,
                  compress_storage=True,
-                 compression_level=3):
+                 compression_level=3,
+                 device=None):
         self.save_dir = save_dir
+        self.device = device
         self.module_structure_dir = module_structure_dir
         self.model_name = model_name
         self.steps_per_block = steps_per_block
@@ -111,18 +112,10 @@ class LayerRecorder:
             'count_hash_output_grad': 0,
             'count_hash_parameters': 0,
             'count_hash_optimizer_state': 0,
-            'count_save_blocks': 0,
-            'count_async_submit': 0,
-            'count_copy_forward': 0,
-            'count_copy_backward': 0,
-            'count_copy_parameters': 0,
-            'count_copy_optimizer_state': 0,
-            'count_copy_dataset': 0,
-            'count_cuda_sync': 0,
-            'count_backpressure': 0
         }
         self.executor = ThreadPoolExecutor(max_workers=16) if async_save else None
         self.pending_futures = []
+        self.compress_processes = []
         self.stats_lock = threading.Lock()
         self.pinned_buffer_pool = {}
         self.buffer_pool_lock = threading.Lock()
@@ -156,11 +149,12 @@ with open(output_file, 'wb') as f_out:
 os.remove(input_file)
 """
         
-        subprocess.Popen(
+        process = subprocess.Popen(
             [sys.executable, '-c', compress_script],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
+        self.compress_processes.append(process)
     
     def decompress_tensor(self, compressed_data):
         dctx = zstd.ZstdDecompressor()
@@ -226,7 +220,7 @@ os.remove(input_file)
         else:
             record[sync_key] = tensor.detach().cpu()
 
-    def copy_named_tensors_to_record(self, tensors, record, sync_key, async_key, time_key, count_key):
+    def copy_named_tensors_to_record(self, tensors, record, sync_key, async_key, time_key):
         copy_start = time.time()
         if self.async_save:
             record[async_key] = {}
@@ -238,7 +232,6 @@ os.remove(input_file)
             record[sync_key] = {name: tensor.detach().cpu() for name, tensor in tensors.items()}
         with self.stats_lock:
             self.time_stats[time_key] += time.time() - copy_start
-            self.time_stats[count_key] += 1
 
     def copy_optimizer_state_to_record(self, params_to_record, record):
         copy_start = time.time()
@@ -270,7 +263,6 @@ os.remove(input_file)
                         record['optimizer_state'][name][k] = v
         with self.stats_lock:
             self.time_stats['copy_optimizer_state'] += time.time() - copy_start
-            self.time_stats['count_copy_optimizer_state'] += 1
 
     def enqueue_async_save(self, record, save_sync):
         if not self.async_save:
@@ -283,17 +275,15 @@ os.remove(input_file)
         self.pending_futures.append(future)
         with self.stats_lock:
             self.time_stats['async_submit'] += time.time() - submit_start
-            self.time_stats['count_async_submit'] += 1
 
     def cuda_sync_for_save(self, record_time):
         if not record_time:
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(self.device)
             return
         sync_start = time.time()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(self.device)
         with self.stats_lock:
             self.time_stats['cuda_synchronize'] += time.time() - sync_start
-            self.time_stats['count_cuda_sync'] += 1
 
     def storage_file_category(self, file, root):
         if file in ('input.pt', 'output.pt', 'input.pt.zst', 'output.pt.zst'):
@@ -308,11 +298,11 @@ os.remove(input_file)
             return 'hashes'
         return 'other'
         
-    # Merkle-root hash via aftune_torch.ops.flat_root
+    # Map-reduce hash via aftune_torch.ops.flat_root
     def get_hash(self, tensor, category):
         assert(tensor.is_contiguous())
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        #if tensor.is_cuda:
+        #    torch.cuda.synchronize(tensor.device)
         start_time = time.time()
         root = aftune_torch.ops.flat_root(tensor, chunk_size=self.chunk_size, use_blake3=self.use_blake3)
         result = root.hex()
@@ -335,6 +325,16 @@ os.remove(input_file)
             return empty_hook
         
         def hook(module, input, output):
+            if not self.layer_order_finalized:
+                if layer_name not in self.layer_order:
+                    self.layer_order.append(layer_name)
+                if is_last_layer and self.current_step == 0:
+                    self.layer_order_finalized = True
+                    self.finalize_layer_blocks()
+            
+            if self.layer_blocks_finalized and not self.is_block_first_layer(layer_name) and not self.is_block_last_layer(layer_name):
+                return
+            
             if layer_name not in self.records:
                 self.records[layer_name] = {}
             if self.current_step not in self.records[layer_name]:
@@ -352,26 +352,15 @@ os.remove(input_file)
             else:
                 output_tensor = output
             
-            if not self.layer_order_finalized:
-                if layer_name not in self.layer_order:
-                    self.layer_order.append(layer_name)
-                
-                if is_last_layer and self.current_step == 0:
-                    self.layer_order_finalized = True
-                    self.finalize_layer_blocks()
-            
             layer_block_idx = self.layer_to_block.get(layer_name, 0) if self.layer_blocks_finalized else 0
             should_save_activation = (layer_block_idx % self.activation_interval == 0)
             
-            is_block_first = self.is_block_first_layer(layer_name)
             is_block_last = self.is_block_last_layer(layer_name)
             is_global_first = self.is_first_layer(layer_name)
             if is_global_first:
                 record['input_hash'] = self.get_hash(input_tensor, 'hash_input')
             if is_block_last:
                 record['output_hash'] = self.get_hash(output_tensor, 'hash_output')
-            if not is_block_first and not is_block_last:
-                record['is_internal_layer'] = True
             copy_start = time.time()
             if is_global_first and should_save_activation:
                 self.copy_tensor_to_record(input_tensor, record, 'input', 'input_async')
@@ -380,7 +369,6 @@ os.remove(input_file)
             copy_time = time.time() - copy_start
             with self.stats_lock:
                 self.time_stats['copy_forward_activations'] += copy_time
-                self.time_stats['count_copy_forward'] += 1
             
         return hook
     
@@ -429,7 +417,7 @@ os.remove(input_file)
         if should_save_parameters:
             self.copy_named_tensors_to_record(
                 params_to_record, record, 'parameters', 'parameters_async',
-                'copy_parameters', 'count_copy_parameters',
+                'copy_parameters',
             )
             if self.optimizer is not None:
                 self.copy_optimizer_state_to_record(params_to_record, record)
@@ -467,6 +455,9 @@ os.remove(input_file)
             return empty_hook
         
         def hook(module, grad_input, grad_output):
+            if self.layer_blocks_finalized and not self.is_block_first_layer(layer_name) and not self.is_block_last_layer(layer_name):
+                return
+            
             if layer_name not in self.records:
                 self.records[layer_name] = {}
             if self.current_step not in self.records[layer_name]:
@@ -506,7 +497,6 @@ os.remove(input_file)
                 grad_cpu_copy_time = time.time() - grad_cpu_copy_start
                 with self.stats_lock:
                     self.time_stats['copy_backward_grads'] += grad_cpu_copy_time
-                    self.time_stats['count_copy_backward'] += 1
             
             self.save_layer_record(layer_name, self.current_step, save_hashes=True)
             if layer_name in self.records and self.current_step in self.records[layer_name]:
@@ -524,14 +514,16 @@ os.remove(input_file)
         record = self.dataset_records[self.current_step]
         record['loss'] = loss.detach().cpu().item() if isinstance(loss, torch.Tensor) else loss
         record['input_ids_hash'] = self.get_hash(input_ids, 'hash_input')
-        record['labels_hash'] = self.get_hash(labels, 'hash_input')
+        if labels is input_ids:
+            record['labels_hash'] = record['input_ids_hash']
+        else:
+            record['labels_hash'] = self.get_hash(labels, 'hash_input')
         dataset_copy_start = time.time()
         self.copy_tensor_to_record(input_ids, record, 'input_ids', 'input_ids_async')
         self.copy_tensor_to_record(labels, record, 'labels', 'labels_async')
         dataset_copy_time = time.time() - dataset_copy_start
         with self.stats_lock:
             self.time_stats['copy_dataset_input'] += dataset_copy_time
-            self.time_stats['count_copy_dataset'] += 1
         
     # Save module skeleton (no weights) for offline replay
     def save_module_structure(self, layer_name: str, module):
@@ -550,7 +542,14 @@ os.remove(input_file)
             original_device = next(module.parameters()).device
         
         module.cpu()
-        torch.save(module, structure_path)
+        if layer_name == 'rotary_emb':
+            torch.save(module, structure_path)
+        else:
+            buffer = io.BytesIO()
+            torch.save(module, buffer)
+            buffer.seek(0)
+            meta_module = torch.load(buffer, map_location='meta', weights_only=False)
+            torch.save(meta_module, structure_path)
         
         if original_device is not None and str(original_device) != 'cpu':
             module.to(original_device)
@@ -595,7 +594,6 @@ os.remove(input_file)
                 if layer_block_id not in self.block_to_layers:
                     self.block_to_layers[layer_block_id] = []
                 self.block_to_layers[layer_block_id].append(layer_name)
-        
     
     def is_first_layer(self, layer_name: str):
         return bool(self.layer_order) and layer_name == self.layer_order[0]
@@ -666,7 +664,7 @@ os.remove(input_file)
         record = self.dataset_records[step]
         
         def save_sync(record_copy):
-            self.save_dataset_record_sync(step, record_copy, True)
+            self.save_dataset_record_sync(step, record_copy, not self.async_save)
         self.enqueue_async_save(record, save_sync)
     
     def save_layer_record_sync(self, layer_name: str, step: int, record: dict, record_time: bool = True, save_hashes: bool = True):
@@ -789,7 +787,6 @@ os.remove(input_file)
             if record_time:
                 with self.stats_lock:
                     self.time_stats['save_hashes'] += time.time() - save_start
-                    self.time_stats['count_save_blocks'] += 1
     
     def save_layer_record(self, layer_name: str, step: int, save_hashes: bool = True):
         if self.warmup_mode:
@@ -801,7 +798,7 @@ os.remove(input_file)
         record = self.records[layer_name][step]
         
         def save_sync(record_copy):
-            self.save_layer_record_sync(layer_name, step, record_copy, True, save_hashes)
+            self.save_layer_record_sync(layer_name, step, record_copy, not self.async_save, save_hashes)
         self.enqueue_async_save(record, save_sync)
     
     def print_time_stats(self):
@@ -826,12 +823,11 @@ os.remove(input_file)
         total_hash_time = sum(self.time_stats[k] for k, _, _ in hash_categories)
         total_hash_count = sum(self.time_stats[k] for _, _, k in hash_categories)
         total_disk_save = sum(self.time_stats[k] for k in save_keys)
-        cuda_sync_time = self.time_stats['cuda_synchronize']
         sync_wait_time = self.time_stats['async_submit'] + self.time_stats['backpressure_wait']
         if self.async_save:
             total_blocking_time = total_copy_time + total_hash_time + sync_wait_time
         else:
-            total_blocking_time = total_copy_time + total_hash_time + total_disk_save + cuda_sync_time
+            total_blocking_time = total_copy_time + total_hash_time + total_disk_save + self.time_stats['cuda_synchronize']
 
         print(f"  I/O: {total_copy_time:.3f} seconds")
         print("  Hash:")
@@ -851,6 +847,9 @@ os.remove(input_file)
             for future in self.pending_futures:
                 future.result()
             self.pending_futures.clear()
+        for process in self.compress_processes:
+            process.wait()
+        self.compress_processes.clear()
     
     # Export trained weights to final_model/ after training
     def save_final_model_parameters(self, model, tracked_modules):
@@ -949,7 +948,6 @@ os.remove(input_file)
             oldest_future.result()
             with self.stats_lock:
                 self.time_stats['backpressure_wait'] += time.time() - wait_start
-                self.time_stats['count_backpressure'] += 1
     
     # Flush pending records and write metadata.json
     def save_all_records(self):
@@ -1052,7 +1050,11 @@ os.remove(input_file)
         if not os.path.exists(structure_path):
             raise FileNotFoundError(f"Structure file not found for {layer_name}: {structure_path}")
         
-        return torch.load(structure_path, map_location=device, weights_only=False)
+        if layer_name == 'rotary_emb':
+            return torch.load(structure_path, map_location=device, weights_only=False)
+        module = torch.load(structure_path, map_location='meta', weights_only=False)
+        module.to_empty(device=device)
+        return module
     
     # Load one step's layer record (params, hashes, optimizer, activations)
     def load_layer_record(self, layer_name: str, step: int, device):
@@ -1064,15 +1066,26 @@ os.remove(input_file)
         block_dir = os.path.join(self.save_dir, f"block_{layer_block_idx}_{step_block_idx}")
         if not os.path.exists(block_dir):
             raise FileNotFoundError(f"Block not found: {block_dir}")
-        
+
+        block_layers = self.block_to_layers.get(layer_block_idx, [])
+        is_internal_layer = (
+            layer_name in block_layers
+            and layer_name != block_layers[0]
+            and layer_name != block_layers[-1]
+        )
+
         layer_dir = os.path.join(block_dir, layer_name)
         if not os.path.exists(layer_dir):
+            if is_internal_layer:
+                return {}
             raise FileNotFoundError(f"Layer directory not found: {layer_dir}")
-        
+
         step_dir = os.path.join(layer_dir, f"step_{step_in_block}")
         if not os.path.exists(step_dir):
+            if is_internal_layer:
+                return {}
             raise FileNotFoundError(f"Step not found: {step_dir}")
-        
+
         record = {}
         for key, filename in (
             ('input', 'input.pt'),
@@ -1083,7 +1096,7 @@ os.remove(input_file)
             path = os.path.join(step_dir, filename)
             if self.file_exists(path):
                 record[key] = self.load_tensor_compressed(path).to(device)
-        
+
         hash_file = os.path.join(step_dir, 'hashes.json')
         if os.path.exists(hash_file):
             with open(hash_file, 'r') as f:
@@ -1124,6 +1137,41 @@ os.remove(input_file)
                         record['optimizer_state_hashes'] = checkpoint_hashes['optimizer_state_hashes']
         
         return record
+
+    def load_layer_hashes(self, layer_name, step):
+        step_block_idx = step // self.steps_per_block
+        step_in_block = step % self.steps_per_block
+
+        layer_block_idx = self.layer_to_block.get(layer_name, 0) if self.layer_blocks_finalized else 0
+
+        block_dir = os.path.join(self.save_dir, f"block_{layer_block_idx}_{step_block_idx}")
+        if not os.path.exists(block_dir):
+            raise FileNotFoundError(f"Block not found: {block_dir}")
+
+        block_layers = self.block_to_layers.get(layer_block_idx, [])
+        is_internal_layer = (
+            layer_name in block_layers
+            and layer_name != block_layers[0]
+            and layer_name != block_layers[-1]
+        )
+
+        layer_dir = os.path.join(block_dir, layer_name)
+        if not os.path.exists(layer_dir):
+            if is_internal_layer:
+                return {}
+            raise FileNotFoundError(f"Layer directory not found: {layer_dir}")
+
+        step_dir = os.path.join(layer_dir, f"step_{step_in_block}")
+        if not os.path.exists(step_dir):
+            if is_internal_layer:
+                return {}
+            raise FileNotFoundError(f"Step not found: {step_dir}")
+
+        hash_file = os.path.join(step_dir, 'hashes.json')
+        if os.path.exists(hash_file):
+            with open(hash_file, 'r') as f:
+                return json.load(f)
+        return {}
     
     def load_layer_input(self, layer_name: str, step: int, device):
         self.ensure_metadata_loaded()

@@ -3,15 +3,15 @@ import argparse
 import os
 import json
 import time
-from layer_recorder import LayerRecorder, set_deterministic
+from recorder import Recorder, set_deterministic
 from verify_block import forward_block_layer, get_hash
-from decoder_replay import new_rope_state
+from replay_utils import new_rope_state
 from PIL import Image
 from torchvision import transforms
 
 # Forward-only replay of one inference layer block vs recorded activations
 def verify_inference(layer_block_id, inference_records_dir, block_records_dir, device, strict_hash, image_path, use_float32, use_float64):
-    rec = LayerRecorder(save_dir=inference_records_dir)
+    rec = Recorder(save_dir=inference_records_dir)
     metadata = rec.load_metadata()
     if not metadata:
         return {'error': f'Cannot load metadata: {os.path.join(inference_records_dir, "metadata.json")}'}
@@ -31,10 +31,10 @@ def verify_inference(layer_block_id, inference_records_dir, block_records_dir, d
     }
     
     load_start = time.time()
-    block_recorder = LayerRecorder(save_dir=block_records_dir)
+    block_recorder = Recorder(save_dir=block_records_dir)
     block_metadata = block_recorder.load_metadata()
     model_name = block_metadata['model_name']
-    is_llm = model_name not in ['resnet152', 'vit_large', 'dinov2_giant']
+    is_llm = model_name not in ['vit_large', 'dinov2_giant']
     
     block_recorder.module_structure_dir = block_metadata['module_structure_dir']
     block_recorder.model_name = model_name
@@ -98,9 +98,8 @@ def verify_inference(layer_block_id, inference_records_dir, block_records_dir, d
     rec.layer_order_finalized = True
     rec.layer_blocks_finalized = True
     
-    ds = rec.load_dataset_record(step, device=device)
-
     if is_llm:
+        ds = rec.load_dataset_record(step, device=device)
         if 'input_ids' not in ds:
             return {'error': f'Cannot find input_ids record at step {step}'}
         input_data = ds['input_ids'].to(device)
@@ -125,7 +124,7 @@ def verify_inference(layer_block_id, inference_records_dir, block_records_dir, d
                 image = image.to(dtype=model_dtype)
         input_data = image
 
-    step_records = {name: rec.load_layer_record(name, step, device=device) for name in layer_names}
+    step_records = {name: rec.load_layer_hashes(name, step) for name in layer_names}
     time_stats['load_data'] += time.time() - load_start
 
     layer_outputs = {}

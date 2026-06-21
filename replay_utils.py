@@ -63,6 +63,22 @@ def new_rope_state(rotary_emb_module, model_name):
     return {"text_pos": None, "embeddings": None, "use_qwen3": use_qwen3_position_ids(model_name)}
 
 
+def expand_layernorm_output_grad(model_name, last_layer, last_output, expected_output_grad):
+    if last_layer != "layernorm":
+        return expected_output_grad
+    if model_name == "dinov2_giant":
+        hidden = last_output.shape[-1]
+        grad = torch.zeros_like(last_output)
+        grad[:, 0, :] = expected_output_grad[:, :hidden]
+        grad[:, 1:, :] = expected_output_grad[:, hidden:].unsqueeze(1) / (last_output.shape[1] - 1)
+        return grad
+    if model_name == "vit_large":
+        grad = torch.zeros_like(last_output)
+        grad[:, 0, :] = expected_output_grad
+        return grad
+    return expected_output_grad
+
+
 def replay_decoder_layer(layer_module, hidden_states, rotary_emb_module, rotary_cache, rope_state):
     if rotary_emb_module is not None and rope_state is not None:
         ensure_rope_state(rotary_emb_module, hidden_states, rope_state)

@@ -15,6 +15,7 @@
  
 #include <stdlib.h>
 #include <memory.h>
+#include <cuda_runtime.h>
 extern "C" {
 #include "sha256.cuh"
 }
@@ -187,13 +188,12 @@ __global__ void kernel_sha256_hash(BYTE* indata, WORD inlen, BYTE* outdata, WORD
 
 extern "C"
 {
-void mcm_cuda_sha256_hash_batch(BYTE* in, WORD inlen, BYTE* out, WORD n_batch, size_t total_size)
+void mcm_cuda_sha256_hash_batch(BYTE* in, WORD inlen, BYTE* out, WORD n_batch, size_t total_size, cudaStream_t stream)
 {
 	WORD thread = 256;
 	WORD block = (n_batch + thread - 1) / thread;
 
-	kernel_sha256_hash << < block, thread >> > (in, inlen, out, n_batch, total_size);
-	cudaDeviceSynchronize();
+	kernel_sha256_hash << < block, thread, 0, stream >> > (in, inlen, out, n_batch, total_size);
 	cudaError_t error = cudaGetLastError();
 	if (error != cudaSuccess) {
 		printf("Error cuda sha256 hash: %s \n", cudaGetErrorString(error));

@@ -1,5 +1,4 @@
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -10,10 +9,9 @@ DEFAULT_IMAGE_PATH = str(AFTUNE_ROOT / "image.jpg")
 
 import torch
 from torch.utils.checkpoint import checkpoint
-from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
-from load_model import load_vit_large, load_dinov2_giant, load_image, load_llm_model
-from decoder_replay import decoder_layer_forward, llm_decoder_rope
+from load_model import load_finetuned_vision_model, load_image, load_llm_model
+from replay_utils import decoder_layer_forward, llm_decoder_rope
 
 
 def load_base_model(model_path, device):
@@ -23,15 +21,9 @@ def load_base_model(model_path, device):
 
 
 def load_image_model(model_path, model_type, device):
-    if model_type == 'vit_large':
-        model, _ = load_vit_large(device=device)
+    if model_type in ('vit_large', 'dinov2_giant'):
+        model, _ = load_finetuned_vision_model(model_path, model_type, device)
         model = model.to(dtype=torch.float32)
-    elif model_type == 'dinov2_giant':
-        model, _ = load_dinov2_giant(pretrained=True, device=device)
-        state_dict_path = os.path.join(model_path, 'dinov2_giant.pth')
-        if os.path.exists(state_dict_path):
-            state_dict = torch.load(state_dict_path, map_location=device, weights_only=False)
-            model.load_state_dict(state_dict)
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
     
@@ -39,11 +31,9 @@ def load_image_model(model_path, model_type, device):
     return model
 
 
-
-
-def forward_with_all_blocks_attack_llm(model, inputs_embeds, 
+def forward_with_all_blocks_attack_llm(model, inputs_embeds,
                                       block_deltas, attack_indices=None,
-                                      use_checkpoint=False):
+                                      low_memory_usage=False):
     target_dtype = model.get_input_embeddings().weight.dtype
     inputs_embeds = inputs_embeds.to(target_dtype)
     
@@ -64,7 +54,7 @@ def forward_with_all_blocks_attack_llm(model, inputs_embeds,
         if idx in attack_indices and idx in block_deltas and block_deltas[idx] is not None:
             hidden_states = hidden_states + block_deltas[idx].to(target_dtype)
 
-        if use_checkpoint and hidden_states.requires_grad:
+        if low_memory_usage and hidden_states.requires_grad:
             hidden_states = checkpoint(layer_forward, model.model.layers[idx], hidden_states, use_reentrant=False)
         else:
             hidden_states = layer_forward(model.model.layers[idx], hidden_states)
@@ -80,7 +70,7 @@ def forward_with_all_blocks_attack_llm(model, inputs_embeds,
 
 def forward_with_all_blocks_attack_image(model, model_type, image, 
                                          block_deltas, attack_indices=None,
-                                         use_checkpoint=False):
+                                         low_memory_usage=False):
     attack_indices = attack_indices or list(block_deltas.keys())
     
     if model_type == 'vit_large':
@@ -95,7 +85,7 @@ def forward_with_all_blocks_attack_image(model, model_type, image,
             if idx in attack_indices and idx in block_deltas and block_deltas[idx] is not None:
                 hidden_states = hidden_states + block_deltas[idx].to(hidden_states.dtype)
             
-            if use_checkpoint and hidden_states.requires_grad:
+            if low_memory_usage and hidden_states.requires_grad:
                 hidden_states = checkpoint(layer_forward, model.vit.encoder.layer[idx], hidden_states, use_reentrant=False)
             else:
                 output = model.vit.encoder.layer[idx](hidden_states)
@@ -118,7 +108,7 @@ def forward_with_all_blocks_attack_image(model, model_type, image,
             if idx in attack_indices and idx in block_deltas and block_deltas[idx] is not None:
                 hidden_states = hidden_states + block_deltas[idx].to(hidden_states.dtype)
             
-            if use_checkpoint and hidden_states.requires_grad:
+            if low_memory_usage and hidden_states.requires_grad:
                 hidden_states = checkpoint(layer_forward, model.dinov2.encoder.layer[idx], hidden_states, use_reentrant=False)
             else:
                 output = model.dinov2.encoder.layer[idx](hidden_states)
@@ -139,7 +129,7 @@ def forward_with_all_blocks_attack_image(model, model_type, image,
 
 def build_inputs_embeds(model, tokenizer, text, device):
     messages = [{"role": "user", "content": text}]
-    formatted_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    formatted_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
     input_ids = tokenizer(formatted_text, return_tensors="pt")["input_ids"].to(device)
     embed_layer = model.get_input_embeddings()
     with torch.no_grad():
@@ -227,7 +217,7 @@ def get_yes_token_ids(tokenizer):
 
 def get_target_ids_llm(model, tokenizer, text, device, attack_mode):
     messages = [{"role": "user", "content": text}]
-    formatted_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    formatted_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
     input_ids = tokenizer(formatted_text, return_tensors="pt")["input_ids"].to(device)
     with torch.no_grad():
         base_out = model(input_ids=input_ids, use_cache=False)
@@ -327,8 +317,8 @@ def init_delta(x0, epsilon):
 
 def pgd_attack_all_blocks_llm(model, tokenizer, text, device, block_epsilons,
                               iters, step_size, attack_mode, y_id,
-                              n_id, yes_ids, interval=0, use_checkpoint=False):
-    input_ids, inputs_embeds = build_inputs_embeds(model, tokenizer, text, device)
+                              n_id, yes_ids, interval=0, low_memory_usage=False):
+    _, inputs_embeds = build_inputs_embeds(model, tokenizer, text, device)
     block_inputs = get_all_blocks_input_llm(model, inputs_embeds)
     num_blocks = len(block_inputs)
     
@@ -343,7 +333,7 @@ def pgd_attack_all_blocks_llm(model, tokenizer, text, device, block_epsilons,
         current_deltas = {idx: block_xs_grad[idx] - block_x0s[idx] for idx in attack_indices}
         
         torch.cuda.empty_cache()
-        outputs = forward_with_all_blocks_attack_llm(model, inputs_embeds, current_deltas, attack_indices, use_checkpoint=use_checkpoint)
+        outputs = forward_with_all_blocks_attack_llm(model, inputs_embeds, current_deltas, attack_indices, low_memory_usage=low_memory_usage)
         last = outputs.logits[:, -1, :].to(torch.float32)
         
         if check_flipped_llm(last, y_id, n_id, yes_ids, attack_mode):
@@ -386,7 +376,7 @@ def pgd_attack_all_blocks_llm(model, tokenizer, text, device, block_epsilons,
 
 def pgd_attack_all_blocks_image(model, model_type, image, device, block_epsilons,
                                 iters, step_size, orig_class_id, target_class_id,
-                                attack_mode, interval=0, use_checkpoint=False):
+                                attack_mode, interval=0, low_memory_usage=False):
     image = image.to(device)
     block_inputs = get_all_blocks_input_image(model, model_type, image)
     num_blocks = len(block_inputs)
@@ -402,7 +392,7 @@ def pgd_attack_all_blocks_image(model, model_type, image, device, block_epsilons
         current_deltas = {idx: block_xs_grad[idx] - block_x0s[idx] for idx in attack_indices}
         
         torch.cuda.empty_cache()
-        logits = forward_with_all_blocks_attack_image(model, model_type, image, current_deltas, attack_indices, use_checkpoint=use_checkpoint)
+        logits = forward_with_all_blocks_attack_image(model, model_type, image, current_deltas, attack_indices, low_memory_usage=low_memory_usage)
         logits = logits.to(torch.float32)
         
         if check_flipped_image(logits, orig_class_id, target_class_id, attack_mode):
@@ -456,44 +446,14 @@ def compute_norms_all_blocks(deltas, block_inputs):
     return total_linf, block_l2s, block_rel_l2s
 
 
-def format_block_l2s(block_l2s, block_rel_l2s):
-    if not block_rel_l2s:
-        return ""
-    
-    parts = []
-    for idx in sorted(block_rel_l2s.keys()):
-        rel_l2 = block_rel_l2s[idx]
-        parts.append(f"block_{idx}: L2={rel_l2:.3e}")
-    
-    return " | ".join(parts)
-
-
 def print_block_rel_l2_summary(rel_l2_or_blocks):
     vals = list(rel_l2_or_blocks.values())
-    print(f"min L2: {min(vals):.3e}")
+    print(f"Min L2: {min(vals):.3e}")
     print(f"Max L2: {max(vals):.3e}")
 
 
-def format_scientific_latex(value):
-    if value == 0.0:
-        return "$0$"
-    
-    s = f"{value:.3e}"
-    if 'e' in s:
-        coeff, exp = s.split('e')
-        coeff = coeff.rstrip('0').rstrip('.')
-        exp_int = int(exp)
-        if exp_int == 0:
-            return f"${coeff}$"
-        else:
-            return f"${coeff} \\times 10^{{{exp_int}}}$"
-    return f"${s}$"
-
-
-def show_attack_result_llm(model, tokenizer, text, device, attack_type,
-                          attack_location, delta_or_deltas,
-                          attack_mode="untargeted"):
-    input_ids, inputs_embeds = build_inputs_embeds(model, tokenizer, text, device)
+def show_attack_result_llm(model, tokenizer, text, device, delta_or_deltas):
+    _, inputs_embeds = build_inputs_embeds(model, tokenizer, text, device)
     
     with torch.no_grad():
         original_outputs = forward_with_all_blocks_attack_llm(model, inputs_embeds, {}, [])
@@ -513,18 +473,9 @@ def show_attack_result_llm(model, tokenizer, text, device, attack_type,
         print(f"After: {top_token}")
 
 
-def show_attack_result_image(model, model_type, image, device, attack_type,
-                            attack_location, delta_or_deltas, orig_class_id, target_class_id,
-                            attack_mode):
+def show_attack_result_image(model, model_type, image, device, delta_or_deltas, orig_class_id):
     image = image.to(device)
-    
-    with torch.no_grad():
-        original_logits = forward_with_all_blocks_attack_image(model, model_type, image, {}, [])
-        if hasattr(original_logits, 'logits'):
-            original_logits = original_logits.logits
-        original_logits = original_logits.to(torch.float32)
-        original_top_id = torch.argmax(original_logits[0], dim=-1).item()
-    
+
     with torch.no_grad():
         attack_indices = list(delta_or_deltas.keys())
         logits = forward_with_all_blocks_attack_image(model, model_type, image, delta_or_deltas, attack_indices)
@@ -538,7 +489,7 @@ def show_attack_result_image(model, model_type, image, device, attack_type,
 
 
 def run_single_sample(model, device, max_epsilon, pgd_iters, interval=0, 
-                      use_checkpoint=False, search_steps=32, retry_times=2,
+                      low_memory_usage=False, search_steps=32, retry_times=2,
                       tokenizer=None, text=None, attack_mode=None,
                       model_type=None, image=None, target_class_id=None):
     is_image_mode = model_type is not None
@@ -550,8 +501,6 @@ def run_single_sample(model, device, max_epsilon, pgd_iters, interval=0,
     else:
         _, original_embeds = build_inputs_embeds(model, tokenizer, text, device)
         y_id, n_id, yes_ids = get_target_ids_llm(model, tokenizer, text, device, attack_mode)
-        if y_id is None:
-            raise ValueError("Cannot find target token")
         block_inputs = get_all_blocks_input_llm(model, original_embeds)
     
     num_blocks = len(block_inputs)
@@ -561,28 +510,30 @@ def run_single_sample(model, device, max_epsilon, pgd_iters, interval=0,
         if is_image_mode:
             return pgd_attack_all_blocks_image(
                 model, model_type, image, device, block_epsilons, pgd_iters, step_size,
-                orig_class_id, target_class_id, attack_mode, interval, use_checkpoint=use_checkpoint
+                orig_class_id, target_class_id, attack_mode, interval, low_memory_usage=low_memory_usage
             )
         else:
             return pgd_attack_all_blocks_llm(
                 model, tokenizer, text, device, block_epsilons, pgd_iters, step_size,
-                attack_mode, y_id, n_id, yes_ids, interval, use_checkpoint=use_checkpoint
+                attack_mode, y_id, n_id, yes_ids, interval, low_memory_usage=low_memory_usage
             )
     
-    block_epsilons_max = {idx: max_epsilon for idx in attack_indices}
-    flipped_max, delta_max, block_l2s_max = attack_fn(block_epsilons_max, max_epsilon * 0.25)
-    
-    if not flipped_max:
-        raise ValueError(f"Unsupported model type: {model_type}")
-    
+    flipped_max = False
+    while not flipped_max:
+        block_epsilons_max = {idx: max_epsilon for idx in attack_indices}
+        flipped_max, delta_max, _ = attack_fn(block_epsilons_max, max_epsilon * 0.25)
+        if not flipped_max:
+            failed_epsilon = max_epsilon
+            max_epsilon *= 10.0
+            print("Attack failed at max_epsilon=%s, retry at max_epsilon=%s" % (failed_epsilon, max_epsilon))
+
     block_lo = {idx: 0.0 for idx in attack_indices}
     block_hi = {idx: max_epsilon for idx in attack_indices}
     best_block_epsilons = {idx: max_epsilon for idx in attack_indices}
     best_delta = delta_max
-    best_block_l2s = block_l2s_max
-    
+
     pbar = tqdm(range(search_steps), desc="Binary search", leave=False)
-    for step_idx in pbar:
+    for _ in pbar:
         block_epsilons_mid = {idx: (block_lo[idx] + block_hi[idx]) / 2.0 for idx in attack_indices}
         step_size = max_epsilon * 0.25
         
@@ -597,24 +548,17 @@ def run_single_sample(model, device, max_epsilon, pgd_iters, interval=0,
         if flipped:
             best_block_epsilons = block_epsilons_mid.copy()
             best_delta = delta
-            best_block_l2s = block_l2s
             for idx in attack_indices:
                 block_hi[idx] = block_epsilons_mid[idx]
-            min_actual_eps = min(best_block_l2s.values()) if best_block_l2s else 0.0
-            pbar.set_postfix({"min_eps": f"{min_actual_eps:.3e}"})
+            if block_l2s:
+                pbar.set_postfix({"min_eps": f"{min(block_l2s.values()):.3e}"})
         else:
             for idx in attack_indices:
                 block_lo[idx] = block_epsilons_mid[idx]
-    
-    if best_delta is None:
-        best_delta = delta_max
-        best_block_l2s = block_l2s_max
-    
-    linf, block_l2s, block_rel_l2s = compute_norms_all_blocks(best_delta, block_inputs)
+
+    linf, _, block_rel_l2s = compute_norms_all_blocks(best_delta, block_inputs)
     max_eps = max(best_block_epsilons.values()) if best_block_epsilons else max_epsilon
-    pgd_result = (max_eps, linf, block_l2s, block_rel_l2s, "all_blocks", best_delta)
-    
-    return pgd_result
+    return max_eps, linf, block_rel_l2s, best_delta
 
 
 def main():
@@ -630,7 +574,7 @@ def main():
     parser.add_argument("--target_class_id", type=int, default=0)
     parser.add_argument("--attack_mode", type=str, default="untargeted", choices=["targeted", "untargeted"])
     parser.add_argument("--interval", type=int, default=0)
-    parser.add_argument("--use_checkpoint", action="store_true")
+    parser.add_argument("--low_memory_usage", action="store_true")
     parser.add_argument("--retry_times", type=int, default=2)
     args = parser.parse_args()
 
@@ -641,62 +585,41 @@ def main():
         device = next(model.parameters()).device
 
         image = load_image(args.image_path)
-        
-        if args.interval > 0:
-            if args.model_type == 'vit_large':
-                num_blocks = len(model.vit.encoder.layer)
-            elif args.model_type == 'dinov2_giant':
-                num_blocks = len(model.dinov2.encoder.layer)
-            else:
-                num_blocks = 0
-            attack_indices = get_attack_block_indices(num_blocks, args.interval)
-        
+
         target_class_id = args.target_class_id if args.attack_mode == "targeted" else None
-        pgd_result = run_single_sample(
+        eps, linf, rel_l2_or_blocks, delta_or_deltas = run_single_sample(
             model, device,
             args.max_epsilon, args.pgd_iters,
             interval=args.interval,
-            use_checkpoint=args.use_checkpoint,
+            low_memory_usage=args.low_memory_usage,
             retry_times=args.retry_times,
             model_type=args.model_type, image=image, target_class_id=target_class_id, attack_mode=args.attack_mode
         )
-        
-        if pgd_result is not None:
-            eps, linf, l2_or_blocks, rel_l2_or_blocks, attack_location, delta_or_deltas = pgd_result
-            print(f"PGD: epsilon={eps:.3e}, L_inf={linf:.3e}, location={attack_location}")
-            
-            orig_class_id = get_target_class_id_image(model, args.model_type, image, device)
-            show_attack_result_image(model, args.model_type, image, device, "PGD", attack_location, delta_or_deltas, 
-                                   orig_class_id, target_class_id, args.attack_mode)
-            if isinstance(rel_l2_or_blocks, dict) and rel_l2_or_blocks:
-                print_block_rel_l2_summary(rel_l2_or_blocks)
+        print(f"PGD: epsilon={eps:.3e}, L_inf={linf:.3e}, location=all_blocks")
+
+        orig_class_id = get_target_class_id_image(model, args.model_type, image, device)
+        show_attack_result_image(model, args.model_type, image, device, delta_or_deltas, orig_class_id)
+        if rel_l2_or_blocks:
+            print_block_rel_l2_summary(rel_l2_or_blocks)
 
     else:
         model, tokenizer = load_base_model(args.model_path, args.device)
         device = next(model.parameters()).device
 
         text = args.text or "Answer with yes or no only. Is 2+2 equal to 4?"
-        
-        if args.interval > 0:
-            num_blocks = len(model.model.layers)
-            attack_indices = get_attack_block_indices(num_blocks, args.interval)
-        
-        pgd_result = run_single_sample(
+
+        eps, linf, rel_l2_or_blocks, delta_or_deltas = run_single_sample(
             model, device,
             args.max_epsilon, args.pgd_iters,
             interval=args.interval,
-            use_checkpoint=args.use_checkpoint,
+            low_memory_usage=args.low_memory_usage,
             retry_times=args.retry_times,
             tokenizer=tokenizer, text=text, attack_mode=args.attack_mode
         )
-        
-        if pgd_result is not None:
-            eps, linf, l2_or_blocks, rel_l2_or_blocks, attack_location, delta_or_deltas = pgd_result
-            print(f"PGD: epsilon={eps:.3e}, L_inf={linf:.3e}, location={attack_location}")
-            show_attack_result_llm(model, tokenizer, text, device, "PGD", attack_location, delta_or_deltas, attack_mode=args.attack_mode)
-            if isinstance(rel_l2_or_blocks, dict) and rel_l2_or_blocks:
-                print_block_rel_l2_summary(rel_l2_or_blocks)
-            
+        print(f"PGD: epsilon={eps:.3e}, L_inf={linf:.3e}, location=all_blocks")
+        show_attack_result_llm(model, tokenizer, text, device, delta_or_deltas)
+        if rel_l2_or_blocks:
+            print_block_rel_l2_summary(rel_l2_or_blocks)
 
 
 if __name__ == "__main__":

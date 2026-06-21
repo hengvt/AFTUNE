@@ -5,7 +5,7 @@ import os
 import json
 import time
 from tqdm import tqdm
-from layer_recorder import LayerRecorder, set_deterministic
+from recorder import Recorder, set_deterministic
 from verify_block import (
     copy_module_params,
     forward_block_layer,
@@ -13,7 +13,7 @@ from verify_block import (
     lm_head_cross_entropy_loss,
     restore_optimizer_state,
 )
-from decoder_replay import load_saved_rotary_emb, new_rope_state
+from replay_utils import load_saved_rotary_emb, new_rope_state, expand_layernorm_output_grad
 
 
 # Build replay modules from structures; load params from checkpoint or final_model
@@ -307,6 +307,9 @@ def prepare_checkpoint_for_block(layer_block_id, step_block_id, recorder, device
                     last_output = layer_outputs[last_layer]
                     if isinstance(last_output, tuple):
                         last_output = last_output[0]
+                    expected_output_grad = expand_layernorm_output_grad(
+                        model_name, last_layer, last_output, expected_output_grad,
+                    )
                     last_output.backward(expected_output_grad, retain_graph=True)
                 time_stats['load_data'] += time.time() - load_start
                 opt_start = time.time()
@@ -391,12 +394,12 @@ def main():
     args = parser.parse_args()
 
     set_deterministic(seed=args.seed, enabled=args.deterministic)
-    temp_recorder = LayerRecorder(save_dir=args.record_dir)
+    temp_recorder = Recorder(save_dir=args.record_dir)
     metadata = temp_recorder.load_metadata()
     is_inference = (metadata['learning_rate'] is None)
 
     if is_inference:
-        block_recorder = LayerRecorder(save_dir=args.block_records_dir)
+        block_recorder = Recorder(save_dir=args.block_records_dir)
         block_metadata = block_recorder.load_metadata()
         module_structure_dir = block_metadata['module_structure_dir'] if 'module_structure_dir' in block_metadata else metadata['module_structure_dir']
         model_name = block_metadata['model_name'] if 'model_name' in block_metadata else metadata['model_name']
@@ -404,7 +407,7 @@ def main():
         module_structure_dir = metadata['module_structure_dir']
         model_name = metadata['model_name']
 
-    recorder = LayerRecorder(
+    recorder = Recorder(
         save_dir=args.record_dir,
         steps_per_block=metadata['steps_per_block'],
         layers_per_block=metadata['layers_per_block'],
@@ -418,6 +421,7 @@ def main():
         optimizer_type=metadata['optimizer_type'],
         module_structure_dir=module_structure_dir,
         model_name=model_name,
+        compress_storage=False,
     )
     recorder.layer_to_block = metadata['layer_to_block']
     recorder.block_to_layers = {int(k): v for k, v in metadata['block_to_layers'].items()}

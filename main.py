@@ -4,13 +4,13 @@ import os
 import shutil
 from finetune import finetune_llm_full, finetune_llm_lora, get_tracked_modules
 from load_data import get_llm_dataloader, get_imagenet_dataloader
-from load_model import load_resnet152, load_vit_large, load_dinov2_giant, load_llm_model
+from load_model import load_vit_large, load_dinov2_giant, load_llm_model
 from finetune import finetune_imagenet
-from layer_recorder import LayerRecorder, set_deterministic
+from recorder import Recorder, set_deterministic
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('-t', '--model_type', type=str, default='llm', choices=['llm', 'resnet152', 'vit_large', 'dinov2_giant'], help='Model type')
+    parser.add_argument('-t', '--model_type', type=str, default='llm', choices=['llm', 'vit_large', 'dinov2_giant'], help='Model type')
     parser.add_argument('-p', '--model_path', type=str, default='../models/Llama-3.1-8B-Instruct', help='LLM model path')
     parser.add_argument('-d', '--device', type=str, default='cuda:0')
     parser.add_argument('-s', '--steps_per_block', type=int, default=1, help='Steps per checkpoint (B_S)')
@@ -37,6 +37,9 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_steps', type=int, default=0)
     args = parser.parse_args()
     
+    if args.device.startswith('cuda'):
+        torch.cuda.set_device(args.device)
+    
     set_deterministic(seed=args.seed, enabled=args.deterministic)
     
     if os.path.exists(args.record_dir):
@@ -46,7 +49,6 @@ if __name__ == '__main__':
         shutil.rmtree(args.output_dir)
     
     model_name_map = {
-        'resnet152': 'resnet152',
         'vit_large': 'vit_large',
         'dinov2_giant': 'dinov2_giant'
     }
@@ -54,7 +56,7 @@ if __name__ == '__main__':
     if args.model_type == 'llm' and args.model_path:
         model_name = os.path.basename(os.path.normpath(args.model_path))
     
-    recorder = LayerRecorder(
+    recorder = Recorder(
         save_dir=args.record_dir,
         steps_per_block=args.steps_per_block,
         layers_per_block=args.layers_per_block,
@@ -66,6 +68,7 @@ if __name__ == '__main__':
         optimizer_type='adamw' if args.use_adam else 'sgd',
         module_structure_dir=args.module_structure_dir,
         model_name=model_name,
+        device=args.device,
     )
     
     tracked_modules = None
@@ -93,39 +96,27 @@ if __name__ == '__main__':
         model.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
     
-    elif args.model_type == 'resnet152':
-        model, model_hooks = load_resnet152(device=args.device)
-        dataloader = get_imagenet_dataloader(batch_size=args.batch_size)
-        
-        finetune_imagenet(model, dataloader, recorder, model_hooks, 
-                        epochs=args.epochs, learning_rate=args.lr, max_samples=args.max_samples if args.max_samples is not None else 8192,
-                        warmup_steps=args.warmup_steps)
-        
-        tracked_modules = {name: module for module, name in model_hooks}
-        os.makedirs(args.output_dir, exist_ok=True)
-        torch.save(model.state_dict(), os.path.join(args.output_dir, 'resnet152.pth'))
-    
     elif args.model_type == 'vit_large':
-        model, model_hooks = load_vit_large(device=args.device)
+        model, layer_tracked = load_vit_large(device=args.device)
         dataloader = get_imagenet_dataloader(batch_size=args.batch_size)
         
-        finetune_imagenet(model, dataloader, recorder, model_hooks, 
+        finetune_imagenet(model, dataloader, recorder, layer_tracked, 
                         epochs=args.epochs, learning_rate=args.lr, max_samples=args.max_samples if args.max_samples is not None else 8192,
                         warmup_steps=args.warmup_steps)
         
-        tracked_modules = {name: module for module, name in model_hooks}
+        tracked_modules = {name: module for module, name in layer_tracked}
         os.makedirs(args.output_dir, exist_ok=True)
-        model.save_pretrained(args.output_dir)
+        torch.save(model.state_dict(), os.path.join(args.output_dir, 'vit_large.pth'))
     
     elif args.model_type == 'dinov2_giant':
-        model, model_hooks = load_dinov2_giant(device=args.device)
+        model, layer_tracked = load_dinov2_giant(device=args.device)
         dataloader = get_imagenet_dataloader(batch_size=args.batch_size)
         
-        finetune_imagenet(model, dataloader, recorder, model_hooks, 
+        finetune_imagenet(model, dataloader, recorder, layer_tracked, 
                         epochs=args.epochs, learning_rate=args.lr, max_samples=args.max_samples if args.max_samples is not None else 8192,
                         warmup_steps=args.warmup_steps)
         
-        tracked_modules = {name: module for module, name in model_hooks}
+        tracked_modules = {name: module for module, name in layer_tracked}
         os.makedirs(args.output_dir, exist_ok=True)
         torch.save(model.state_dict(), os.path.join(args.output_dir, 'dinov2_giant.pth'))
     
